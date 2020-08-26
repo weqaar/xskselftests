@@ -4708,7 +4708,7 @@ static int bpf_core_types_are_compat(const struct btf *local_btf, __u32 local_id
 
 	/* caller made sure that names match (ignoring flavor suffix) */
 	local_type = btf__type_by_id(local_btf, local_id);
-	targ_type = btf__type_by_id(local_btf, local_id);
+	targ_type = btf__type_by_id(targ_btf, targ_id);
 	if (btf_kind(local_type) != btf_kind(targ_type))
 		return 0;
 
@@ -5390,7 +5390,7 @@ static int bpf_core_apply_relo(struct bpf_program *prog,
 			       struct hashmap *cand_cache)
 {
 	const char *prog_name = bpf_program__title(prog, false);
-	struct bpf_core_spec local_spec, cand_spec, targ_spec;
+	struct bpf_core_spec local_spec, cand_spec, targ_spec = {};
 	const void *type_key = u32_as_hash_key(relo->type_id);
 	struct bpf_core_relo_res cand_res, targ_res;
 	const struct btf_type *local_type;
