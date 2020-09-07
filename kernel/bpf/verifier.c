@@ -21,6 +21,7 @@
 #include <linux/ctype.h>
 #include <linux/error-injection.h>
 #include <linux/bpf_lsm.h>
+#include <linux/btf_ids.h>
 
 #include "disasm.h"
 
@@ -5829,6 +5830,67 @@ static void scalar_min_max_or(struct bpf_reg_state *dst_reg,
 	__update_reg_bounds(dst_reg);
 }
 
+static void scalar32_min_max_xor(struct bpf_reg_state *dst_reg,
+				 struct bpf_reg_state *src_reg)
+{
+	bool src_known = tnum_subreg_is_const(src_reg->var_off);
+	bool dst_known = tnum_subreg_is_const(dst_reg->var_off);
+	struct tnum var32_off = tnum_subreg(dst_reg->var_off);
+	s32 smin_val = src_reg->s32_min_value;
+
+	/* Assuming scalar64_min_max_xor will be called so it is safe
+	 * to skip updating register for known case.
+	 */
+	if (src_known && dst_known)
+		return;
+
+	/* We get both minimum and maximum from the var32_off. */
+	dst_reg->u32_min_value = var32_off.value;
+	dst_reg->u32_max_value = var32_off.value | var32_off.mask;
+
+	if (dst_reg->s32_min_value >= 0 && smin_val >= 0) {
+		/* XORing two positive sign numbers gives a positive,
+		 * so safe to cast u32 result into s32.
+		 */
+		dst_reg->s32_min_value = dst_reg->u32_min_value;
+		dst_reg->s32_max_value = dst_reg->u32_max_value;
+	} else {
+		dst_reg->s32_min_value = S32_MIN;
+		dst_reg->s32_max_value = S32_MAX;
+	}
+}
+
+static void scalar_min_max_xor(struct bpf_reg_state *dst_reg,
+			       struct bpf_reg_state *src_reg)
+{
+	bool src_known = tnum_is_const(src_reg->var_off);
+	bool dst_known = tnum_is_const(dst_reg->var_off);
+	s64 smin_val = src_reg->smin_value;
+
+	if (src_known && dst_known) {
+		/* dst_reg->var_off.value has been updated earlier */
+		__mark_reg_known(dst_reg, dst_reg->var_off.value);
+		return;
+	}
+
+	/* We get both minimum and maximum from the var_off. */
+	dst_reg->umin_value = dst_reg->var_off.value;
+	dst_reg->umax_value = dst_reg->var_off.value | dst_reg->var_off.mask;
+
+	if (dst_reg->smin_value >= 0 && smin_val >= 0) {
+		/* XORing two positive sign numbers gives a positive,
+		 * so safe to cast u64 result into s64.
+		 */
+		dst_reg->smin_value = dst_reg->umin_value;
+		dst_reg->smax_value = dst_reg->umax_value;
+	} else {
+		dst_reg->smin_value = S64_MIN;
+		dst_reg->smax_value = S64_MAX;
+	}
+
+	__update_reg_bounds(dst_reg);
+}
+
 static void __scalar32_min_max_lsh(struct bpf_reg_state *dst_reg,
 				   u64 umin_val, u64 umax_val)
 {
@@ -6136,6 +6198,11 @@ static int adjust_scalar_min_max_vals(struct bpf_verifier_env *env,
 		dst_reg->var_off = tnum_or(dst_reg->var_off, src_reg.var_off);
 		scalar32_min_max_or(dst_reg, &src_reg);
 		scalar_min_max_or(dst_reg, &src_reg);
+		break;
+	case BPF_XOR:
+		dst_reg->var_off = tnum_xor(dst_reg->var_off, src_reg.var_off);
+		scalar32_min_max_xor(dst_reg, &src_reg);
+		scalar_min_max_xor(dst_reg, &src_reg);
 		break;
 	case BPF_LSH:
 		if (umax_val >= insn_bitness) {
@@ -9301,6 +9368,23 @@ static int check_map_prog_compatibility(struct bpf_verifier_env *env,
 		return -EINVAL;
 	}
 
+	if (prog->aux->sleepable)
+		switch (map->map_type) {
+		case BPF_MAP_TYPE_HASH:
+		case BPF_MAP_TYPE_LRU_HASH:
+		case BPF_MAP_TYPE_ARRAY:
+			if (!is_preallocated_map(map)) {
+				verbose(env,
+					"Sleepable programs can only use preallocated hash maps\n");
+				return -EINVAL;
+			}
+			break;
+		default:
+			verbose(env,
+				"Sleepable programs can only use array and hash maps\n");
+			return -EINVAL;
+		}
+
 	return 0;
 }
 
@@ -10919,6 +11003,37 @@ static int check_attach_modify_return(struct bpf_prog *prog, unsigned long addr)
 	return -EINVAL;
 }
 
+/* non exhaustive list of sleepable bpf_lsm_*() functions */
+BTF_SET_START(btf_sleepable_lsm_hooks)
+#ifdef CONFIG_BPF_LSM
+BTF_ID(func, bpf_lsm_bprm_committed_creds)
+#else
+BTF_ID_UNUSED
+#endif
+BTF_SET_END(btf_sleepable_lsm_hooks)
+
+static int check_sleepable_lsm_hook(u32 btf_id)
+{
+	return btf_id_set_contains(&btf_sleepable_lsm_hooks, btf_id);
+}
+
+/* list of non-sleepable functions that are otherwise on
+ * ALLOW_ERROR_INJECTION list
+ */
+BTF_SET_START(btf_non_sleepable_error_inject)
+/* Three functions below can be called from sleepable and non-sleepable context.
+ * Assume non-sleepable from bpf safety point of view.
+ */
+BTF_ID(func, __add_to_page_cache_locked)
+BTF_ID(func, should_fail_alloc_page)
+BTF_ID(func, should_failslab)
+BTF_SET_END(btf_non_sleepable_error_inject)
+
+static int check_non_sleepable_error_inject(u32 btf_id)
+{
+	return btf_id_set_contains(&btf_non_sleepable_error_inject, btf_id);
+}
+
 static int check_attach_btf_id(struct bpf_verifier_env *env)
 {
 	struct bpf_prog *prog = env->prog;
@@ -10935,6 +11050,12 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 	struct btf *btf;
 	long addr;
 	u64 key;
+
+	if (prog->aux->sleepable && prog->type != BPF_PROG_TYPE_TRACING &&
+	    prog->type != BPF_PROG_TYPE_LSM) {
+		verbose(env, "Only fentry/fexit/fmod_ret and lsm programs can be sleepable\n");
+		return -EINVAL;
+	}
 
 	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS)
 		return check_struct_ops_btf_id(env);
@@ -11144,13 +11265,36 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 			}
 		}
 
-		if (prog->expected_attach_type == BPF_MODIFY_RETURN) {
+		if (prog->aux->sleepable) {
+			ret = -EINVAL;
+			switch (prog->type) {
+			case BPF_PROG_TYPE_TRACING:
+				/* fentry/fexit/fmod_ret progs can be sleepable only if they are
+				 * attached to ALLOW_ERROR_INJECTION and are not in denylist.
+				 */
+				if (!check_non_sleepable_error_inject(btf_id) &&
+				    within_error_injection_list(addr))
+					ret = 0;
+				break;
+			case BPF_PROG_TYPE_LSM:
+				/* LSM progs check that they are attached to bpf_lsm_*() funcs.
+				 * Only some of them are sleepable.
+				 */
+				if (check_sleepable_lsm_hook(btf_id))
+					ret = 0;
+				break;
+			default:
+				break;
+			}
+			if (ret)
+				verbose(env, "%s is not sleepable\n",
+					prog->aux->attach_func_name);
+		} else if (prog->expected_attach_type == BPF_MODIFY_RETURN) {
 			ret = check_attach_modify_return(prog, addr);
 			if (ret)
 				verbose(env, "%s() is not modifiable\n",
 					prog->aux->attach_func_name);
 		}
-
 		if (ret)
 			goto out;
 		tr->func.addr = (void *)addr;

@@ -51,6 +51,9 @@ static int add_policy(struct nl_policy_dump **statep,
 	if (!state)
 		return -ENOMEM;
 
+	memset(&state->policies[state->n_alloc], 0,
+	       flex_array_size(state, policies, n_alloc - state->n_alloc));
+
 	state->policies[state->n_alloc].policy = policy;
 	state->policies[state->n_alloc].maxtype = maxtype;
 	state->n_alloc = n_alloc;
@@ -261,7 +264,8 @@ send_attribute:
 		else
 			type = NL_ATTR_TYPE_BINARY;
 
-		if (pt->validation_type != NLA_VALIDATE_NONE) {
+		if (pt->validation_type == NLA_VALIDATE_RANGE ||
+		    pt->validation_type == NLA_VALIDATE_RANGE_WARN_TOO_LONG) {
 			struct netlink_range_validation range;
 
 			nla_get_range_unsigned(pt, &range);
