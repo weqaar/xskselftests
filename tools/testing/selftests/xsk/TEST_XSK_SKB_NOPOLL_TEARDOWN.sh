@@ -5,11 +5,11 @@
 . prereqs.sh
 . xskenv.sh
 
-TEST_NAME="DRV POLL"
+TEST_NAME="SKB NOPOLL TEARDOWN"
 
-vethXDPnative ${VETH0} ${VETH1} ${NS1}
+vethXDPgeneric ${VETH0} ${VETH1} ${NS1}
 
-./${XSKDIR}/${XSKOBJ} -i ${VETH0} -i ${VETH1},${NS1} -N -p -C ${NUMPKTS}
+./${XSKDIR}/${XSKOBJ} -i ${VETH0} -i ${VETH1},${NS1} -S -T -C ${NUMPKTS}
 
 retval=$?
 test_status $retval "${TEST_NAME}"

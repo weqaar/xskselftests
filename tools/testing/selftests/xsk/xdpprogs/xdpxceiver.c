@@ -280,6 +280,7 @@ static struct option long_options[] = {
 	{"xdp-skb", no_argument, 0, 'S'},
 	{"xdp-native", no_argument, 0, 'N'},
 	{"copy", no_argument, 0, 'c'},
+	{"tear-down", no_argument, 0, 'T'},
 	{"debug", optional_argument, 0, 'D'},
 	{"tx-pkt-count", optional_argument, 0, 'C'},
 	{0, 0, 0, 0}
@@ -296,6 +297,7 @@ static void usage(const char *prog)
 	    "  -S, --xdp-skb=n      Use XDP SKB mode\n"
 	    "  -N, --xdp-native=n   Enforce XDP DRV (native) mode\n"
 	    "  -c, --copy           Force copy mode\n"
+	    "  -T, --tear-down      Tear down sockets by repeatedly recreating them\n"
 	    "  -D, --debug          Debug mode - dump packets L2 - L5\n"
 	    "  -C, --tx-pkt-count=n Number of packets to send\n";
 	ksft_print_msg(str, prog);
@@ -369,8 +371,8 @@ static int validate_interfaces(void)
 			ifdict[i]->opt_ifindex = if_nametoindex(ifdict[i]->opt_if);
 			if (!ifdict[i]->opt_ifindex) {
 				ksft_test_result_fail
-					("ERROR: interface \"%s\" does not exist\n",
-					 ifdict[i]->opt_if);
+				    ("ERROR: interface \"%s\" does not exist\n",
+				     ifdict[i]->opt_if);
 				ret = false;
 			} else {
 				ksft_print_msg("Interface found: %s\n", ifdict[i]->opt_if);
@@ -387,7 +389,7 @@ static void parse_command_line(int argc, char **argv)
 	opterr = 0;
 
 	for (;;) {
-		c = getopt_long(argc, argv, "i:q:pSNcDC:", long_options, &option_index);
+		c = getopt_long(argc, argv, "i:q:pSNcTDC:", long_options, &option_index);
 
 		if (c == -1)
 			break;
@@ -424,6 +426,9 @@ static void parse_command_line(int argc, char **argv)
 			break;
 		case 'c':
 			opt_xdp_bind_flags |= XDP_COPY;
+			break;
+		case 'T':
+			opt_teardown = 1;
 			break;
 		case 'D':
 			DEBUG_PKTDUMP = 1;
@@ -465,7 +470,7 @@ static inline void complete_tx_only(struct xsk_socket_info *xsk, int batch_size)
 		kick_tx(xsk);
 
 	rcvd = xsk_ring_cons__peek(&xsk->umem->cq, batch_size, &idx);
-	if (rcvd > 0) {
+	if (rcvd) {
 		xsk_ring_cons__release(&xsk->umem->cq, rcvd);
 		xsk->outstanding_tx -= rcvd;
 		xsk->tx_npkts += rcvd;
@@ -488,7 +493,7 @@ static void rx_pkt(struct xsk_socket_info *xsk, struct pollfd *fds)
 	ret = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd, &idx_fq);
 	while (ret != rcvd) {
 		if (ret < 0)
-			exit_with_error(-ret);
+			exit_with_error(ret);
 		if (xsk_ring_prod__needs_wakeup(&xsk->umem->fq))
 			ret = poll(fds, num_socks, opt_timeout);
 		ret = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd, &idx_fq);
@@ -565,7 +570,7 @@ static void complete_tx_only_all(void *arg)
 		for (i = 0; i < num_socks; i++) {
 			if (((struct ifobjectstruct *)arg)->xsk->outstanding_tx) {
 				complete_tx_only(((struct ifobjectstruct *)
-						  arg)->xsk, opt_batch_size);
+							arg)->xsk, opt_batch_size);
 				pending = !!((struct ifobjectstruct *)arg)->xsk->outstanding_tx;
 			}
 		}
@@ -733,7 +738,7 @@ static void *worker_testapp_validate(void *arg)
 		 * entering before Rx and causing a deadlock
 		 */
 		pthread_mutex_lock(&syncmutextx);
-		while (ret && (ctr < SOCK_RECONF_CTR)) {
+		while (ret && ctr < SOCK_RECONF_CTR) {
 			atomic_store(&spinningtx, 1);
 			xsk_configure_umem((struct ifobjectstruct *)arg,
 					   bufs, NUM_FRAMES * opt_xsk_frame_size);
@@ -749,13 +754,13 @@ static void *worker_testapp_validate(void *arg)
 
 		int spinningrxctr = 0;
 
-		while ((atomic_load(&spinningrx)) && (spinningrxctr < SOCK_RECONF_CTR)) {
+		while (atomic_load(&spinningrx) && spinningrxctr < SOCK_RECONF_CTR) {
 			spinningrxctr++;
 			usleep(USLEEP_MAX);
 		}
 
 		ksft_print_msg("Interface [%s] vector [Tx]\n",
-			       ((struct ifobjectstruct *)arg)->opt_if);
+				 ((struct ifobjectstruct *)arg)->opt_if);
 		for (int i = 0; i < NUM_FRAMES; i++) {
 			/*send EOT frame */
 			if (i == (NUM_FRAMES - 1))
@@ -787,7 +792,7 @@ static void *worker_testapp_validate(void *arg)
 		 * before Rx and causing a deadlock
 		 */
 		pthread_mutex_lock(&syncmutextx);
-		while (ret && (ctr < SOCK_RECONF_CTR)) {
+		while (ret && ctr < SOCK_RECONF_CTR) {
 			atomic_store(&spinningrx, 1);
 			xsk_configure_umem((struct ifobjectstruct *)arg,
 					   bufs, NUM_FRAMES * opt_xsk_frame_size);
@@ -802,7 +807,7 @@ static void *worker_testapp_validate(void *arg)
 			exit_with_error(ret);
 
 		ksft_print_msg("Interface [%s] vector [Rx]\n",
-			       ((struct ifobjectstruct *)arg)->opt_if);
+				 ((struct ifobjectstruct *)arg)->opt_if);
 		xsk_populate_fill_ring(((struct ifobjectstruct *)arg)->umem);
 
 		struct pollfd fds[MAX_SOCKS] = {};
@@ -843,6 +848,8 @@ static void *worker_testapp_validate(void *arg)
 		ksft_print_msg("Received %d packets on interface %s\n",
 			       pktcounter, ((struct ifobjectstruct *)arg)->opt_if);
 
+		if (opt_teardown)
+			ksft_print_msg("Destroying socket\n");
 	}
 
 	xsk_socket__delete(((struct ifobjectstruct *)arg)->xsk->xsk);
@@ -888,16 +895,67 @@ static void testapp_validate(void)
 		free(pktbuf);
 	}
 
+	if (!opt_teardown) {
+		if (UUT == ORDER_CONTENT_VALIDATE_XDP_SKB) {
+			if (opt_poll)
+				ksft_test_result_pass("PASS: SKB POLL\n");
+			else
+				ksft_test_result_pass("PASS: SKB NOPOLL\n");
+		} else if (UUT == ORDER_CONTENT_VALIDATE_XDP_DRV) {
+			if (opt_poll)
+				ksft_test_result_pass("PASS: DRV POLL\n");
+			else
+				ksft_test_result_pass("PASS: DRV NOPOLL\n");
+		}
+	}
+}
+
+static void testapp_socket_teardown(void)
+{
 	if (UUT == ORDER_CONTENT_VALIDATE_XDP_SKB) {
-		if (opt_poll)
-			ksft_test_result_pass("PASS: SKB POLL\n");
-		else
-			ksft_test_result_pass("PASS: SKB NOPOLL\n");
+		if (opt_poll) {
+			ksft_print_msg("Testing SKB POLL Socket Teardown\n");
+			for (int i = 0; i < MAX_TEARDOWN_ITER; i++) {
+				pktcounter = 0;
+				prevpkt = -1;
+				sigvar = 0;
+				ksft_print_msg("Creating socket\n");
+				testapp_validate();
+			}
+			ksft_test_result_pass("PASS: SKB POLL Socket Teardown\n");
+		} else {
+			ksft_print_msg("Testing SKB NOPOLL Socket Teardown\n");
+			for (int i = 0; i < MAX_TEARDOWN_ITER; i++) {
+				pktcounter = 0;
+				prevpkt = -1;
+				sigvar = 0;
+				ksft_print_msg("Creating socket\n");
+				testapp_validate();
+			}
+			ksft_test_result_pass("PASS: SKB NOPOLL Socket Teardown\n");
+		}
 	} else if (UUT == ORDER_CONTENT_VALIDATE_XDP_DRV) {
-		if (opt_poll)
-			ksft_test_result_pass("PASS: DRV POLL\n");
-		else
-			ksft_test_result_pass("PASS: DRV NOPOLL\n");
+		if (opt_poll) {
+			ksft_print_msg("Testing DRV POLL Socket Teardown\n");
+			for (int i = 0; i < MAX_TEARDOWN_ITER; i++) {
+				pktcounter = 0;
+				prevpkt = -1;
+				sigvar = 0;
+				ksft_print_msg("Creating socket\n");
+				testapp_validate();
+			}
+			ksft_test_result_pass("PASS: DRV POLL Socket Teardown\n");
+		} else {
+			ksft_print_msg("Testing DRV NOPOLL Socket Teardown\n");
+			for (int i = 0; i < MAX_TEARDOWN_ITER; i++) {
+				pktcounter = 0;
+				prevpkt = -1;
+				sigvar = 0;
+				ksft_print_msg("Creating socket\n");
+				testapp_validate();
+			}
+			ksft_test_result_pass("PASS: DRV NOPOLL Socket Teardown\n");
+		}
 	}
 }
 
@@ -963,7 +1021,11 @@ int main(int argc, char **argv)
 	pthread_init_mutex();
 
 	ksft_set_plan(1);
-	testapp_validate();
+
+	if (!opt_teardown)
+		testapp_validate();
+	else
+		testapp_socket_teardown();
 
 	for (int i = 0; i < MAX_INTERFACES; i++)
 		free(ifdict[i]);
