@@ -20,10 +20,11 @@
 #define MAX_INTERFACES 2
 #define MAX_INTERFACE_NAME_CHARS 7
 #define MAX_INTERFACES_NAMESPACE_CHARS 10
+#define MAX_MAC_STR 18
 #define MAX_IP4_STR 16
 #define MAX_IP6_STR 40
-#define MIN_PKT_SIZE 64
 #define MAX_SOCKS 1
+#define MIN_PKT_SIZE 64
 #define ETH_FCS_SIZE 4
 #define PKT_HDR_SIZE (sizeof(struct ethhdr) + sizeof(struct iphdr) + \
 			sizeof(struct udphdr))
@@ -44,9 +45,11 @@ typedef __u8 u8;
 
 enum TESTS {
 	ORDER_CONTENT_VALIDATE_XDP_SKB = 1,
+	ORDER_CONTENT_VALIDATE_XDP_DRV = 2,
 };
 
 u8 UUT;
+u8 DEBUG_PKTDUMP;
 u32 NUM_FRAMES;
 
 static u32 opt_xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST;
@@ -149,5 +152,11 @@ struct pkt {
 
 	TAILQ_ENTRY(pkt) pktnodes;
 } *pktnoderx, *pktnoderxq;
+
+struct pktframe {
+	char *payload;
+} *pktobj;
+
+struct pktframe **pktbuf;
 
 #endif				/* XDPXCEIVER_H */

@@ -278,7 +278,9 @@ static struct option long_options[] = {
 	{"queue", optional_argument, 0, 'q'},
 	{"poll", no_argument, 0, 'p'},
 	{"xdp-skb", no_argument, 0, 'S'},
+	{"xdp-native", no_argument, 0, 'N'},
 	{"copy", no_argument, 0, 'c'},
+	{"debug", optional_argument, 0, 'D'},
 	{"tx-pkt-count", optional_argument, 0, 'C'},
 	{0, 0, 0, 0}
 };
@@ -292,7 +294,9 @@ static void usage(const char *prog)
 	    "  -q, --queue=n        Use queue n (default 0)\n"
 	    "  -p, --poll           Use poll syscall\n"
 	    "  -S, --xdp-skb=n      Use XDP SKB mode\n"
+	    "  -N, --xdp-native=n   Enforce XDP DRV (native) mode\n"
 	    "  -c, --copy           Force copy mode\n"
+	    "  -D, --debug          Debug mode - dump packets L2 - L5\n"
 	    "  -C, --tx-pkt-count=n Number of packets to send\n";
 	ksft_print_msg(str, prog);
 }
@@ -312,7 +316,7 @@ static bool switch_namespace(int idx)
 		exit_with_error(errno);
 
 	return true;
-}
+};
 
 static void *nsswitchthread(void *args)
 {
@@ -342,8 +346,7 @@ static int validate_interfaces(void)
 	for (int i = 0; i < MAX_INTERFACES; i++) {
 		if (!strcmp(ifdict[i]->opt_if, "")) {
 			ret = false;
-			ksft_test_result_fail
-				("ERROR: interfaces: -i <int>,<ns> -i <int>,<ns>.");
+			ksft_test_result_fail("ERROR: interfaces: -i <int>,<ns> -i <int>,<ns>.");
 		}
 		if (strcmp(ifdict[i]->opt_ns, "")) {
 			struct targs *targs;
@@ -366,8 +369,8 @@ static int validate_interfaces(void)
 			ifdict[i]->opt_ifindex = if_nametoindex(ifdict[i]->opt_if);
 			if (!ifdict[i]->opt_ifindex) {
 				ksft_test_result_fail
-					("ERROR: [%s] interface \"%s\" does not exist\n",
-					 __func__, ifdict[i]->opt_if);
+					("ERROR: interface \"%s\" does not exist\n",
+					 ifdict[i]->opt_if);
 				ret = false;
 			} else {
 				ksft_print_msg("Interface found: %s\n", ifdict[i]->opt_if);
@@ -384,7 +387,7 @@ static void parse_command_line(int argc, char **argv)
 	opterr = 0;
 
 	for (;;) {
-		c = getopt_long(argc, argv, "i:q:pScC:", long_options, &option_index);
+		c = getopt_long(argc, argv, "i:q:pSNcDC:", long_options, &option_index);
 
 		if (c == -1)
 			break;
@@ -414,8 +417,16 @@ static void parse_command_line(int argc, char **argv)
 			opt_xdp_bind_flags |= XDP_COPY;
 			UUT = ORDER_CONTENT_VALIDATE_XDP_SKB;
 			break;
+		case 'N':
+			opt_xdp_flags |= XDP_FLAGS_DRV_MODE;
+			opt_xdp_bind_flags |= XDP_COPY;
+			UUT = ORDER_CONTENT_VALIDATE_XDP_DRV;
+			break;
 		case 'c':
 			opt_xdp_bind_flags |= XDP_COPY;
+			break;
+		case 'D':
+			DEBUG_PKTDUMP = 1;
 			break;
 		case 'C':
 			opt_pkt_count = atoi(optarg);
@@ -454,7 +465,7 @@ static inline void complete_tx_only(struct xsk_socket_info *xsk, int batch_size)
 		kick_tx(xsk);
 
 	rcvd = xsk_ring_cons__peek(&xsk->umem->cq, batch_size, &idx);
-	if (rcvd) {
+	if (rcvd > 0) {
 		xsk_ring_cons__release(&xsk->umem->cq, rcvd);
 		xsk->outstanding_tx -= rcvd;
 		xsk->tx_npkts += rcvd;
@@ -477,7 +488,7 @@ static void rx_pkt(struct xsk_socket_info *xsk, struct pollfd *fds)
 	ret = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd, &idx_fq);
 	while (ret != rcvd) {
 		if (ret < 0)
-			exit_with_error(ret);
+			exit_with_error(-ret);
 		if (xsk_ring_prod__needs_wakeup(&xsk->umem->fq))
 			ret = poll(fds, num_socks, opt_timeout);
 		ret = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd, &idx_fq);
@@ -554,7 +565,7 @@ static void complete_tx_only_all(void *arg)
 		for (i = 0; i < num_socks; i++) {
 			if (((struct ifobjectstruct *)arg)->xsk->outstanding_tx) {
 				complete_tx_only(((struct ifobjectstruct *)
-							arg)->xsk, opt_batch_size);
+						  arg)->xsk, opt_batch_size);
 				pending = !!((struct ifobjectstruct *)arg)->xsk->outstanding_tx;
 			}
 		}
@@ -594,6 +605,58 @@ static void tx_only_all(void *arg)
 		complete_tx_only_all(arg);
 }
 
+static void worker_pkt_dump(void)
+{
+	struct in_addr ipaddr;
+
+	fprintf(stdout, "---------------------------------------\n");
+	for (int iter = 0; iter < NUM_FRAMES - 1; iter++) {
+		/*extract L2 frame */
+		fprintf(stdout, "DEBUG>> L2: dst mac: ");
+		for (int i = 0; i < ETH_ALEN; i++)
+			fprintf(stdout, "%02X", ((struct ethhdr *)
+						pktbuf[iter]->payload)->h_dest[i]);
+
+		fprintf(stdout, "\nDEBUG>> L2: src mac: ");
+		for (int i = 0; i < ETH_ALEN; i++)
+			fprintf(stdout, "%02X", ((struct ethhdr *)
+						pktbuf[iter]->payload)->h_source[i]);
+
+		/*extract L3 frame */
+		fprintf(stdout, "\nDEBUG>> L3: ip_hdr->ihl: %02X\n",
+			((struct iphdr *)(pktbuf[iter]->payload + sizeof(struct ethhdr)))->ihl);
+
+		ipaddr.s_addr =
+		    ((struct iphdr *)(pktbuf[iter]->payload + sizeof(struct ethhdr)))->saddr;
+		fprintf(stdout, "DEBUG>> L3: ip_hdr->saddr: %s\n", inet_ntoa(ipaddr));
+
+		ipaddr.s_addr =
+		    ((struct iphdr *)(pktbuf[iter]->payload + sizeof(struct ethhdr)))->daddr;
+		fprintf(stdout, "DEBUG>> L3: ip_hdr->daddr: %s\n", inet_ntoa(ipaddr));
+
+		/*extract L4 frame */
+		fprintf(stdout, "DEBUG>> L4: udp_hdr->src: %d\n",
+			ntohs(((struct udphdr *)(pktbuf[iter]->payload +
+						 sizeof(struct ethhdr) +
+						 sizeof(struct iphdr)))->source));
+
+		fprintf(stdout, "DEBUG>> L4: udp_hdr->dst: %d\n",
+			ntohs(((struct udphdr *)(pktbuf[iter]->payload +
+						 sizeof(struct ethhdr) +
+						 sizeof(struct iphdr)))->dest));
+		/*extract L5 frame */
+		int payload = *((uint32_t *)(pktbuf[iter]->payload + PKT_HDR_SIZE));
+
+		if (payload == EOT) {
+			ksft_print_msg("End-of-tranmission frame received\n");
+			fprintf(stdout, "---------------------------------------\n");
+			break;
+		}
+		fprintf(stdout, "DEBUG>> L5: payload: %d\n", payload);
+		fprintf(stdout, "---------------------------------------\n");
+	}
+}
+
 static void *worker_pkt_validate(void *arg)
 {
 	u32 payloadseqnum = -2;
@@ -607,6 +670,12 @@ static void *worker_pkt_validate(void *arg)
 			break;
 
 		payloadseqnum = *((uint32_t *)(pktnoderxq->pktframe + PKT_HDR_SIZE));
+		if (DEBUG_PKTDUMP && payloadseqnum != EOT) {
+			pktobj = (struct pktframe *)malloc(sizeof(struct pktframe));
+			pktobj->payload = (char *)malloc(PKT_SIZE);
+			memcpy(pktobj->payload, pktnoderxq->pktframe, PKT_SIZE);
+			pktbuf[payloadseqnum] = pktobj;
+		}
 
 		if (payloadseqnum == EOT) {
 			ksft_print_msg("End-of-tranmission frame received: PASS\n");
@@ -616,8 +685,8 @@ static void *worker_pkt_validate(void *arg)
 
 		if (prevpkt + 1 != payloadseqnum) {
 			ksft_test_result_fail
-			    ("ERROR: [%s] prevpkt [%d], payloadseqnum [%d]\n",
-			     __func__, prevpkt, payloadseqnum);
+				("ERROR: [%s] prevpkt [%d], payloadseqnum [%d]\n",
+				 __func__, prevpkt, payloadseqnum);
 			ksft_exit_xfail();
 		}
 
@@ -664,7 +733,7 @@ static void *worker_testapp_validate(void *arg)
 		 * entering before Rx and causing a deadlock
 		 */
 		pthread_mutex_lock(&syncmutextx);
-		while (ret && ctr < SOCK_RECONF_CTR) {
+		while (ret && (ctr < SOCK_RECONF_CTR)) {
 			atomic_store(&spinningtx, 1);
 			xsk_configure_umem((struct ifobjectstruct *)arg,
 					   bufs, NUM_FRAMES * opt_xsk_frame_size);
@@ -680,7 +749,7 @@ static void *worker_testapp_validate(void *arg)
 
 		int spinningrxctr = 0;
 
-		while (atomic_load(&spinningrx) && spinningrxctr < SOCK_RECONF_CTR) {
+		while ((atomic_load(&spinningrx)) && (spinningrxctr < SOCK_RECONF_CTR)) {
 			spinningrxctr++;
 			usleep(USLEEP_MAX);
 		}
@@ -718,7 +787,7 @@ static void *worker_testapp_validate(void *arg)
 		 * before Rx and causing a deadlock
 		 */
 		pthread_mutex_lock(&syncmutextx);
-		while (ret && ctr < SOCK_RECONF_CTR) {
+		while (ret && (ctr < SOCK_RECONF_CTR)) {
 			atomic_store(&spinningrx, 1);
 			xsk_configure_umem((struct ifobjectstruct *)arg,
 					   bufs, NUM_FRAMES * opt_xsk_frame_size);
@@ -740,6 +809,11 @@ static void *worker_testapp_validate(void *arg)
 		int ret, i;
 
 		TAILQ_INIT(&head);
+		if (DEBUG_PKTDUMP) {
+			pktbuf = malloc(sizeof(struct pktframe **) * NUM_FRAMES);
+			if (!pktbuf)
+				exit_with_error(errno);
+		}
 
 		for (i = 0; i < num_socks; i++) {
 			fds[0].fd = xsk_socket__fd(((struct ifobjectstruct *)arg)->xsk->xsk);
@@ -760,7 +834,6 @@ static void *worker_testapp_validate(void *arg)
 
 			if (pthread_create(&rxthread, NULL, worker_pkt_validate, NULL))
 				exit_with_error(errno);
-
 			pthread_join(rxthread, NULL);
 
 			if (sigvar)
@@ -769,6 +842,7 @@ static void *worker_testapp_validate(void *arg)
 
 		ksft_print_msg("Received %d packets on interface %s\n",
 			       pktcounter, ((struct ifobjectstruct *)arg)->opt_if);
+
 	}
 
 	xsk_socket__delete(((struct ifobjectstruct *)arg)->xsk->xsk);
@@ -805,10 +879,26 @@ static void testapp_validate(void)
 	pthread_join(t1, NULL);
 	pthread_join(t0, NULL);
 
-	if (opt_poll)
-		ksft_test_result_pass("PASS: SKB POLL\n");
-	else
-		ksft_test_result_pass("PASS: SKB NOPOLL\n");
+	if (DEBUG_PKTDUMP) {
+		worker_pkt_dump();
+		for (int iter = 0; iter < NUM_FRAMES - 1; iter++) {
+			free(pktbuf[iter]->payload);
+			free(pktbuf[iter]);
+		}
+		free(pktbuf);
+	}
+
+	if (UUT == ORDER_CONTENT_VALIDATE_XDP_SKB) {
+		if (opt_poll)
+			ksft_test_result_pass("PASS: SKB POLL\n");
+		else
+			ksft_test_result_pass("PASS: SKB NOPOLL\n");
+	} else if (UUT == ORDER_CONTENT_VALIDATE_XDP_DRV) {
+		if (opt_poll)
+			ksft_test_result_pass("PASS: DRV POLL\n");
+		else
+			ksft_test_result_pass("PASS: DRV NOPOLL\n");
+	}
 }
 
 static void init_iface_config(void *ifaceconfig)

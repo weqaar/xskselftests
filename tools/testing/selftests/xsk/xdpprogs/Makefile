@@ -5,7 +5,6 @@
 
 XDPPROGS_PATH ?= $(abspath $(srctree)/$(src))
 TOOLS_PATH := $(XDPPROGS_PATH)/../../../../../tools
-CURDIR := $(abspath .)
 
 # List of programs to build
 tprogs-y := xdpxceiver
@@ -41,8 +40,8 @@ TPROGS_CFLAGS += --sysroot=$(SYSROOT)
 TPROGS_LDFLAGS := -L$(SYSROOT)/usr/lib
 endif
 
-TPROGS_LDLIBS += $(LIBBPF) -lelf -lz
-TPROGLDLIBS_xdpxceiver += -pthread
+TPROGS_LDLIBS			+= $(LIBBPF) -lelf -lz
+TPROGLDLIBS_xdpxceiver		+= -pthread
 
 # Allows pointing LLC/CLANG to a LLVM backend with bpf support, redefine on cmdline:
 #  make M=samples/bpf/ LLC=~/git/llvm/build/bin/llc CLANG=~/git/llvm/build/bin/clang

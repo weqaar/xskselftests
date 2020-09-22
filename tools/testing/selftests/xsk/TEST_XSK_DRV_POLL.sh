@@ -5,13 +5,15 @@
 . prereqs.sh
 . xskenv.sh
 
-TEST_NAME="SKB POLL"
+TEST_NAME="DRV POLL"
 
-vethXDPgeneric ${VETH0} ${VETH1} ${NS1}
+vethXDPnative ${VETH0} ${VETH1} ${NS1}
 
-./${XSKDIR}/${XSKOBJ} -i ${VETH0} -i ${VETH1},${NS1} -S -p -C ${NUMPKTS}
+./${XSKDIR}/${XSKOBJ} -i ${VETH0} -i ${VETH1},${NS1} -N -p -C 10000
 
 retval=$?
 test_status $retval "${TEST_NAME}"
+
+cleanup_exit ${VETH0} ${VETH1} ${NS1}
 
 test_exit $retval 0
