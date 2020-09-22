@@ -2,14 +2,15 @@
 # SPDX-License-Identifier: GPL-2.0
 # Copyright(c) 2020 Intel Corporation.
 
+#Includes
 . prereqs.sh
 . xskenv.sh
 
-TEST_NAME="DRV NOPOLL TEARDOWN"
+TEST_NAME="SKB NOPOLL BIDI"
 
-vethXDPnative ${VETH0} ${VETH1} ${NS1}
+vethXDPgeneric ${VETH0} ${VETH1} ${NS1}
 
-./${XSKDIR}/${XSKOBJ} -i ${VETH0} -i ${VETH1},${NS1} -N -T -C ${NUMPKTS}
+./${XSKDIR}/${XSKOBJ} -i ${VETH0} -i ${VETH1},${NS1} -S -B -C ${NUMPKTS}
 
 retval=$?
 test_status $retval "${TEST_NAME}"

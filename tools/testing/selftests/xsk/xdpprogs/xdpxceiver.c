@@ -261,8 +261,13 @@ static int xsk_configure_socket(struct ifobjectstruct *ifobject)
 	cfg.xdp_flags = opt_xdp_flags;
 	cfg.bind_flags = opt_xdp_bind_flags;
 
-	rxr = (ifobject->fv.vector == rx) ? &ifobject->xsk->rx : NULL;
-	txr = (ifobject->fv.vector == tx) ? &ifobject->xsk->tx : NULL;
+	if (!opt_bidi) {
+		rxr = (ifobject->fv.vector == rx) ? &ifobject->xsk->rx : NULL;
+		txr = (ifobject->fv.vector == tx) ? &ifobject->xsk->tx : NULL;
+	} else {
+		rxr = &ifobject->xsk->rx;
+		txr = &ifobject->xsk->tx;
+	}
 
 	ret = xsk_socket__create(&ifobject->xsk->xsk, ifobject->opt_if,
 				 opt_queue, ifobject->umem->umem, rxr, txr, &cfg);
@@ -281,6 +286,7 @@ static struct option long_options[] = {
 	{"xdp-native", no_argument, 0, 'N'},
 	{"copy", no_argument, 0, 'c'},
 	{"tear-down", no_argument, 0, 'T'},
+	{"bidi", optional_argument, 0, 'B'},
 	{"debug", optional_argument, 0, 'D'},
 	{"tx-pkt-count", optional_argument, 0, 'C'},
 	{0, 0, 0, 0}
@@ -298,6 +304,7 @@ static void usage(const char *prog)
 	    "  -N, --xdp-native=n   Enforce XDP DRV (native) mode\n"
 	    "  -c, --copy           Force copy mode\n"
 	    "  -T, --tear-down      Tear down sockets by repeatedly recreating them\n"
+	    "  -B, --bidi           Bi-directional sockets test\n"
 	    "  -D, --debug          Debug mode - dump packets L2 - L5\n"
 	    "  -C, --tx-pkt-count=n Number of packets to send\n";
 	ksft_print_msg(str, prog);
@@ -371,8 +378,8 @@ static int validate_interfaces(void)
 			ifdict[i]->opt_ifindex = if_nametoindex(ifdict[i]->opt_if);
 			if (!ifdict[i]->opt_ifindex) {
 				ksft_test_result_fail
-				    ("ERROR: interface \"%s\" does not exist\n",
-				     ifdict[i]->opt_if);
+					("ERROR: interface \"%s\" does not exist\n",
+					 ifdict[i]->opt_if);
 				ret = false;
 			} else {
 				ksft_print_msg("Interface found: %s\n", ifdict[i]->opt_if);
@@ -389,7 +396,7 @@ static void parse_command_line(int argc, char **argv)
 	opterr = 0;
 
 	for (;;) {
-		c = getopt_long(argc, argv, "i:q:pSNcTDC:", long_options, &option_index);
+		c = getopt_long(argc, argv, "i:q:pSNcTBDC:", long_options, &option_index);
 
 		if (c == -1)
 			break;
@@ -429,6 +436,9 @@ static void parse_command_line(int argc, char **argv)
 			break;
 		case 'T':
 			opt_teardown = 1;
+			break;
+		case 'B':
+			opt_bidi = 1;
 			break;
 		case 'D':
 			DEBUG_PKTDUMP = 1;
@@ -718,39 +728,44 @@ static void *worker_testapp_validate(void *arg)
 
 	pthread_attr_setstacksize(&attr, THREAD_STACK);
 
-	bufs = mmap(NULL, NUM_FRAMES * opt_xsk_frame_size,
-		    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | opt_mmap_flags, -1, 0);
-	if (bufs == MAP_FAILED)
-		exit_with_error(errno);
+	if (!bidi_pass) {
+		bufs = mmap(NULL, NUM_FRAMES * opt_xsk_frame_size,
+			    PROT_READ | PROT_WRITE,
+			    MAP_PRIVATE | MAP_ANONYMOUS | opt_mmap_flags, -1, 0);
+		if (bufs == MAP_FAILED)
+			exit_with_error(errno);
 
-	if (strcmp(((struct ifobjectstruct *)arg)->opt_ns, ""))
-		switch_namespace(((struct ifobjectstruct *)arg)->ifdict_index);
+		if (strcmp(((struct ifobjectstruct *)arg)->opt_ns, ""))
+			switch_namespace(((struct ifobjectstruct *)arg)->ifdict_index);
+	}
 
 	if (((struct ifobjectstruct *)arg)->fv.vector == tx) {
-		xsk_configure_umem((struct ifobjectstruct *)arg, bufs,
-				   NUM_FRAMES * opt_xsk_frame_size);
-		ret = xsk_configure_socket((struct ifobjectstruct *)arg);
-
-		/* Retry Create Socket if it fails as xsk_socket__create()
-		 * is asynchronous
-		 *
-		 * Essential to lock Mutex here to prevent Tx thread from
-		 * entering before Rx and causing a deadlock
-		 */
-		pthread_mutex_lock(&syncmutextx);
-		while (ret && ctr < SOCK_RECONF_CTR) {
-			atomic_store(&spinningtx, 1);
-			xsk_configure_umem((struct ifobjectstruct *)arg,
-					   bufs, NUM_FRAMES * opt_xsk_frame_size);
+		if (!bidi_pass) {
+			xsk_configure_umem((struct ifobjectstruct *)arg, bufs,
+					   NUM_FRAMES * opt_xsk_frame_size);
 			ret = xsk_configure_socket((struct ifobjectstruct *)arg);
-			usleep(USLEEP_MAX);
-			ctr++;
-		}
-		atomic_store(&spinningtx, 0);
-		pthread_mutex_unlock(&syncmutextx);
 
-		if (ctr >= SOCK_RECONF_CTR)
-			exit_with_error(ret);
+			/* Retry Create Socket if it fails as xsk_socket__create()
+			 * is asynchronous
+			 *
+			 * Essential to lock Mutex here to prevent Tx thread from
+			 * entering before Rx and causing a deadlock
+			 */
+			pthread_mutex_lock(&syncmutextx);
+			while (ret && ctr < SOCK_RECONF_CTR) {
+				atomic_store(&spinningtx, 1);
+				xsk_configure_umem((struct ifobjectstruct *)arg,
+						   bufs, NUM_FRAMES * opt_xsk_frame_size);
+				ret = xsk_configure_socket((struct ifobjectstruct *)arg);
+				usleep(USLEEP_MAX);
+				ctr++;
+			}
+			atomic_store(&spinningtx, 0);
+			pthread_mutex_unlock(&syncmutextx);
+
+			if (ctr >= SOCK_RECONF_CTR)
+				exit_with_error(ret);
+		}
 
 		int spinningrxctr = 0;
 
@@ -760,7 +775,7 @@ static void *worker_testapp_validate(void *arg)
 		}
 
 		ksft_print_msg("Interface [%s] vector [Tx]\n",
-				 ((struct ifobjectstruct *)arg)->opt_if);
+			       ((struct ifobjectstruct *)arg)->opt_if);
 		for (int i = 0; i < NUM_FRAMES; i++) {
 			/*send EOT frame */
 			if (i == (NUM_FRAMES - 1))
@@ -780,34 +795,36 @@ static void *worker_testapp_validate(void *arg)
 			       (opt_pkt_count - 1), ((struct ifobjectstruct *)arg)->opt_if);
 		tx_only_all(arg);
 	} else if (((struct ifobjectstruct *)arg)->fv.vector == rx) {
-		xsk_configure_umem((struct ifobjectstruct *)arg, bufs,
-				   NUM_FRAMES * opt_xsk_frame_size);
+		if (!bidi_pass) {
+			xsk_configure_umem((struct ifobjectstruct *)arg, bufs,
+					   NUM_FRAMES * opt_xsk_frame_size);
 
-		ret = xsk_configure_socket((struct ifobjectstruct *)arg);
-
-		/* Retry Create Socket if it fails as xsk_socket__create() is
-		 * asynchronous
-		 *
-		 * Essential to lock Mutex here to prevent Tx thread from entering
-		 * before Rx and causing a deadlock
-		 */
-		pthread_mutex_lock(&syncmutextx);
-		while (ret && ctr < SOCK_RECONF_CTR) {
-			atomic_store(&spinningrx, 1);
-			xsk_configure_umem((struct ifobjectstruct *)arg,
-					   bufs, NUM_FRAMES * opt_xsk_frame_size);
 			ret = xsk_configure_socket((struct ifobjectstruct *)arg);
-			usleep(USLEEP_MAX);
-			ctr++;
-		}
-		atomic_store(&spinningrx, 0);
-		pthread_mutex_unlock(&syncmutextx);
 
-		if (ctr >= SOCK_RECONF_CTR)
-			exit_with_error(ret);
+			/* Retry Create Socket if it fails as xsk_socket__create() is
+			 * asynchronous
+			 *
+			 * Essential to lock Mutex here to prevent Tx thread from entering
+			 * before Rx and causing a deadlock
+			 */
+			pthread_mutex_lock(&syncmutextx);
+			while (ret && ctr < SOCK_RECONF_CTR) {
+				atomic_store(&spinningrx, 1);
+				xsk_configure_umem((struct ifobjectstruct *)arg,
+						   bufs, NUM_FRAMES * opt_xsk_frame_size);
+				ret = xsk_configure_socket((struct ifobjectstruct *)arg);
+				usleep(USLEEP_MAX);
+				ctr++;
+			}
+			atomic_store(&spinningrx, 0);
+			pthread_mutex_unlock(&syncmutextx);
+
+			if (ctr >= SOCK_RECONF_CTR)
+				exit_with_error(ret);
+		}
 
 		ksft_print_msg("Interface [%s] vector [Rx]\n",
-				 ((struct ifobjectstruct *)arg)->opt_if);
+			       ((struct ifobjectstruct *)arg)->opt_if);
 		xsk_populate_fill_ring(((struct ifobjectstruct *)arg)->umem);
 
 		struct pollfd fds[MAX_SOCKS] = {};
@@ -852,8 +869,10 @@ static void *worker_testapp_validate(void *arg)
 			ksft_print_msg("Destroying socket\n");
 	}
 
-	xsk_socket__delete(((struct ifobjectstruct *)arg)->xsk->xsk);
-	(void)xsk_umem__delete(((struct ifobjectstruct *)arg)->umem->umem);
+	if (!opt_bidi || (opt_bidi && bidi_pass)) {
+		xsk_socket__delete(((struct ifobjectstruct *)arg)->xsk->xsk);
+		(void)xsk_umem__delete(((struct ifobjectstruct *)arg)->umem->umem);
+	}
 	pthread_exit(NULL);
 }
 
@@ -862,11 +881,26 @@ static void testapp_validate(void)
 	pthread_attr_init(&attr);
 	pthread_attr_setstacksize(&attr, THREAD_STACK);
 
+	if (opt_bidi && bidi_pass) {
+		pthread_init_mutex();
+		if (!switchingnotify) {
+			ksft_print_msg("Switching Tx/Rx vectors\n");
+			switchingnotify++;
+		}
+	}
+
 	pthread_mutex_lock(&syncmutex);
 
 	/*Spawn RX thread */
-	if (pthread_create(&t0, &attr, worker_testapp_validate, (void *)ifdict[1]))
-		exit_with_error(errno);
+	if (!opt_bidi || (opt_bidi && !bidi_pass)) {
+		if (pthread_create(&t0, &attr, worker_testapp_validate, (void *)ifdict[1]))
+			exit_with_error(errno);
+	} else if (opt_bidi && bidi_pass) {
+		/*switch Tx/Rx vectors */
+		ifdict[0]->fv.vector = rx;
+		if (pthread_create(&t0, &attr, worker_testapp_validate, (void *)ifdict[0]))
+			exit_with_error(errno);
+	}
 
 	struct timespec max_wait = {0, 0};
 
@@ -880,8 +914,15 @@ static void testapp_validate(void)
 	pthread_mutex_unlock(&syncmutex);
 
 	/*Spawn TX thread */
-	if (pthread_create(&t1, &attr, worker_testapp_validate, (void *)ifdict[0]))
-		exit_with_error(errno);
+	if (!opt_bidi || (opt_bidi && !bidi_pass)) {
+		if (pthread_create(&t1, &attr, worker_testapp_validate, (void *)ifdict[0]))
+			exit_with_error(errno);
+	} else if (opt_bidi && bidi_pass) {
+		/*switch Tx/Rx vectors */
+		ifdict[1]->fv.vector = tx;
+		if (pthread_create(&t1, &attr, worker_testapp_validate, (void *)ifdict[1]))
+			exit_with_error(errno);
+	}
 
 	pthread_join(t1, NULL);
 	pthread_join(t0, NULL);
@@ -895,7 +936,7 @@ static void testapp_validate(void)
 		free(pktbuf);
 	}
 
-	if (!opt_teardown) {
+	if (!opt_teardown && !opt_bidi) {
 		if (UUT == ORDER_CONTENT_VALIDATE_XDP_SKB) {
 			if (opt_poll)
 				ksft_test_result_pass("PASS: SKB POLL\n");
@@ -933,6 +974,7 @@ static void testapp_socket_teardown(void)
 				testapp_validate();
 			}
 			ksft_test_result_pass("PASS: SKB NOPOLL Socket Teardown\n");
+
 		}
 	} else if (UUT == ORDER_CONTENT_VALIDATE_XDP_DRV) {
 		if (opt_poll) {
@@ -955,6 +997,59 @@ static void testapp_socket_teardown(void)
 				testapp_validate();
 			}
 			ksft_test_result_pass("PASS: DRV NOPOLL Socket Teardown\n");
+		}
+	}
+}
+
+static void testapp_socket_bidi(void)
+{
+	if (UUT == ORDER_CONTENT_VALIDATE_XDP_SKB) {
+		if (opt_poll) {
+			ksft_print_msg("Testing SKB POLL BiDi Sockets\n");
+			for (int i = 0; i < MAX_BIDI_ITER; i++) {
+				pktcounter = 0;
+				prevpkt = -1;
+				sigvar = 0;
+				ksft_print_msg("Creating socket\n");
+				testapp_validate();
+				bidi_pass++;
+			}
+			ksft_test_result_pass("PASS: SKB POLL BiDi Test\n");
+		} else {
+			ksft_print_msg("Testing SKB NOPOLL BiDi Sockets\n");
+			for (int i = 0; i < MAX_BIDI_ITER; i++) {
+				pktcounter = 0;
+				prevpkt = -1;
+				sigvar = 0;
+				ksft_print_msg("Creating socket\n");
+				testapp_validate();
+				bidi_pass++;
+			}
+			ksft_test_result_pass("PASS: SKB NOPOLL BiDi Test\n");
+		}
+	} else if (UUT == ORDER_CONTENT_VALIDATE_XDP_DRV) {
+		if (opt_poll) {
+			ksft_print_msg("Testing DRV POLL BiDi Sockets\n");
+			for (int i = 0; i < MAX_BIDI_ITER; i++) {
+				pktcounter = 0;
+				prevpkt = -1;
+				sigvar = 0;
+				ksft_print_msg("Creating socket\n");
+				testapp_validate();
+				bidi_pass++;
+			}
+			ksft_test_result_pass("PASS: DRV POLL BiDi Test\n");
+		} else {
+			ksft_print_msg("Testing DRV NOPOLL BiDi Sockets\n");
+			for (int i = 0; i < MAX_BIDI_ITER; i++) {
+				pktcounter = 0;
+				prevpkt = -1;
+				sigvar = 0;
+				ksft_print_msg("Creating socket\n");
+				testapp_validate();
+				bidi_pass++;
+			}
+			ksft_test_result_pass("PASS: DRV NOPOLL BiDi Test\n");
 		}
 	}
 }
@@ -1003,7 +1098,8 @@ int main(int argc, char **argv)
 	ifaceconfig->src_port = UDP_SRC_PORT;
 
 	for (int i = 0; i < MAX_INTERFACES; i++) {
-		ifdict[i] = (struct ifobjectstruct *)malloc(sizeof(struct ifobjectstruct));
+		ifdict[i] = (struct ifobjectstruct *)
+		    malloc(sizeof(struct ifobjectstruct));
 		if (!ifdict[i])
 			exit_with_error(errno);
 
@@ -1022,10 +1118,16 @@ int main(int argc, char **argv)
 
 	ksft_set_plan(1);
 
-	if (!opt_teardown)
+	if (!opt_teardown && !opt_bidi) {
 		testapp_validate();
-	else
+	} else if (opt_teardown && !opt_bidi) {
 		testapp_socket_teardown();
+	} else if (!opt_teardown && opt_bidi) {
+		testapp_socket_bidi();
+	} else {
+		ksft_test_result_fail("ERROR: parameters -T and -B cannot be used together\n");
+		ksft_exit_xfail();
+	}
 
 	for (int i = 0; i < MAX_INTERFACES; i++)
 		free(ifdict[i]);
