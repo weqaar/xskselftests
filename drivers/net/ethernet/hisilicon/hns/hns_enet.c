@@ -11,6 +11,7 @@
 #include <linux/io.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
+#include <linux/irq.h>
 #include <linux/module.h>
 #include <linux/phy.h>
 #include <linux/platform_device.h>
@@ -1290,6 +1291,7 @@ static int hns_nic_init_irq(struct hns_nic_priv *priv)
 
 		rd->ring->ring_name[RCB_RING_NAME_LEN - 1] = '\0';
 
+		irq_set_status_flags(rd->ring->irq, IRQ_NOAUTOEN);
 		ret = request_irq(rd->ring->irq,
 				  hns_irq_handle, 0, rd->ring->ring_name, rd);
 		if (ret) {
@@ -1297,7 +1299,6 @@ static int hns_nic_init_irq(struct hns_nic_priv *priv)
 				   rd->ring->irq);
 			goto out_free_irq;
 		}
-		disable_irq(rd->ring->irq);
 
 		cpu = hns_nic_init_affinity_mask(h->q_num, i,
 						 rd->ring, &rd->mask);
@@ -1829,8 +1830,7 @@ static int hns_nic_uc_unsync(struct net_device *netdev,
 
 /**
  * nic_set_multicast_list - set mutl mac address
- * @netdev: net device
- * @p: mac address
+ * @ndev: net device
  *
  * return void
  */
@@ -2279,8 +2279,10 @@ static int hns_nic_dev_probe(struct platform_device *pdev)
 			priv->enet_ver = AE_VERSION_1;
 		else if (acpi_dev_found(hns_enet_acpi_match[1].id))
 			priv->enet_ver = AE_VERSION_2;
-		else
-			return -ENXIO;
+		else {
+			ret = -ENXIO;
+			goto out_read_prop_fail;
+		}
 
 		/* try to find port-idx-in-ae first */
 		ret = acpi_node_get_property_reference(dev->fwnode,
@@ -2296,7 +2298,8 @@ static int hns_nic_dev_probe(struct platform_device *pdev)
 		priv->fwnode = args.fwnode;
 	} else {
 		dev_err(dev, "cannot read cfg data from OF or acpi\n");
-		return -ENXIO;
+		ret = -ENXIO;
+		goto out_read_prop_fail;
 	}
 
 	ret = device_property_read_u32(dev, "port-idx-in-ae", &port_id);

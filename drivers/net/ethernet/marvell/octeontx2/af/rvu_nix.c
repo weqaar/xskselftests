@@ -737,7 +737,7 @@ static int rvu_nix_aq_enq_inst(struct rvu *rvu, struct nix_aq_enq_req *req,
 		else if (req->ctype == NIX_AQ_CTYPE_MCE)
 			memcpy(mask, &req->mce_mask,
 			       sizeof(struct nix_rx_mce_s));
-		/* Fall through */
+		fallthrough;
 	case NIX_AQ_INSTOP_INIT:
 		if (req->ctype == NIX_AQ_CTYPE_RQ)
 			memcpy(ctx, &req->rq, sizeof(struct nix_rq_ctx_s));
@@ -2508,6 +2508,14 @@ static int set_flowkey_fields(struct nix_rx_flowkey_alg *alg, u32 flow_cfg)
 			field->bytesm1 = 3; /* 4 bytes TID*/
 			field->ltype_match = NPC_LT_LE_GTPU;
 			field->ltype_mask = 0xF;
+			break;
+		case NIX_FLOW_KEY_TYPE_VLAN:
+			field->lid = NPC_LID_LB;
+			field->hdr_offset = 2; /* Skip TPID (2-bytes) */
+			field->bytesm1 = 1; /* 2 Bytes (Actually 12 bits) */
+			field->ltype_match = NPC_LT_LB_CTAG;
+			field->ltype_mask = 0xF;
+			field->fn_mask = 1; /* Mask out the first nibble */
 			break;
 		}
 		field->ena = 1;

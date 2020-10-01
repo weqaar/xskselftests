@@ -8600,11 +8600,11 @@ int bnx2x_set_int_mode(struct bnx2x *bp)
 			       bp->num_queues,
 			       1 + bp->num_cnic_queues);
 
-		/* fall through */
+		fallthrough;
 	case BNX2X_INT_MODE_MSI:
 		bnx2x_enable_msi(bp);
 
-		/* fall through */
+		fallthrough;
 	case BNX2X_INT_MODE_INTX:
 		bp->num_ethernet_queues = 1;
 		bp->num_queues = bp->num_ethernet_queues + bp->num_cnic_queues;
@@ -12390,7 +12390,7 @@ static int bnx2x_init_bp(struct bnx2x *bp)
 	}
 
 	if (CHIP_IS_E1(bp))
-		bp->dropless_fc = 0;
+		bp->dropless_fc = false;
 	else
 		bp->dropless_fc = dropless_fc | bnx2x_get_dropless_info(bp);
 
@@ -15412,7 +15412,7 @@ static int bnx2x_hwtstamp_ioctl(struct bnx2x *bp, struct ifreq *ifr)
 		return -EINVAL;
 	}
 
-	bp->hwtstamp_ioctl_called = 1;
+	bp->hwtstamp_ioctl_called = true;
 	bp->tx_type = config.tx_type;
 	bp->rx_filter = config.rx_filter;
 
@@ -15494,7 +15494,7 @@ void bnx2x_init_ptp(struct bnx2x *bp)
 		bnx2x_init_cyclecounter(bp);
 		timecounter_init(&bp->timecounter, &bp->cyclecounter,
 				 ktime_to_ns(ktime_get_real()));
-		bp->timecounter_init_done = 1;
+		bp->timecounter_init_done = true;
 	}
 
 	DP(BNX2X_MSG_PTP, "PTP initialization ended successfully\n");

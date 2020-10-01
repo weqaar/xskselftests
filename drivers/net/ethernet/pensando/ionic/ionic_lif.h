@@ -4,6 +4,7 @@
 #ifndef _IONIC_LIF_H_
 #define _IONIC_LIF_H_
 
+#include <linux/dim.h>
 #include <linux/pci.h>
 #include "ionic_rx_filter.h"
 
@@ -16,32 +17,32 @@
 #define IONIC_TX_BUDGET_DEFAULT		256
 
 struct ionic_tx_stats {
-	u64 dma_map_err;
 	u64 pkts;
 	u64 bytes;
-	u64 clean;
-	u64 linearize;
 	u64 csum_none;
 	u64 csum;
-	u64 crc32_csum;
 	u64 tso;
 	u64 tso_bytes;
 	u64 frags;
 	u64 vlan_inserted;
+	u64 clean;
+	u64 linearize;
+	u64 crc32_csum;
 	u64 sg_cntr[IONIC_MAX_NUM_SG_CNTR];
+	u64 dma_map_err;
 };
 
 struct ionic_rx_stats {
-	u64 dma_map_err;
-	u64 alloc_err;
 	u64 pkts;
 	u64 bytes;
 	u64 csum_none;
 	u64 csum_complete;
-	u64 csum_error;
 	u64 buffers_posted;
 	u64 dropped;
 	u64 vlan_stripped;
+	u64 csum_error;
+	u64 dma_map_err;
+	u64 alloc_err;
 };
 
 #define IONIC_QCQ_F_INITED		BIT(0)
@@ -66,6 +67,7 @@ struct ionic_qcq {
 	void *sg_base;
 	dma_addr_t sg_base_pa;
 	u32 sg_size;
+	struct dim dim;
 	struct ionic_queue q;
 	struct ionic_cq cq;
 	struct ionic_intr_info intr;
@@ -131,6 +133,8 @@ enum ionic_lif_state_flags {
 	IONIC_LIF_F_LINK_CHECK_REQUESTED,
 	IONIC_LIF_F_FW_RESET,
 	IONIC_LIF_F_SPLIT_INTR,
+	IONIC_LIF_F_TX_DIM_INTR,
+	IONIC_LIF_F_RX_DIM_INTR,
 
 	/* leave this as last */
 	IONIC_LIF_F_STATE_SIZE
@@ -288,7 +292,6 @@ static inline void debug_stats_napi_poll(struct ionic_qcq *qcq,
 
 #define DEBUG_STATS_CQE_CNT(cq)		((cq)->compl_count++)
 #define DEBUG_STATS_RX_BUFF_CNT(q)	((q)->lif->rxqstats[q->index].buffers_posted++)
-#define DEBUG_STATS_INTR_REARM(intr)	((intr)->rearm_count++)
 #define DEBUG_STATS_TXQ_POST(q, dbell)  debug_stats_txq_post(q, dbell)
 #define DEBUG_STATS_NAPI_POLL(qcq, work_done) \
 	debug_stats_napi_poll(qcq, work_done)

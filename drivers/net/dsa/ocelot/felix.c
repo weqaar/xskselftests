@@ -386,6 +386,7 @@ static int felix_parse_ports_node(struct felix *felix,
 		if (err < 0) {
 			dev_err(dev, "Unsupported PHY mode %s on port %d\n",
 				phy_modes(phy_mode), port);
+			of_node_put(child);
 			return err;
 		}
 
@@ -537,23 +538,6 @@ static int felix_init_structs(struct felix *felix, int num_phys_ports)
 	return 0;
 }
 
-static struct ptp_clock_info ocelot_ptp_clock_info = {
-	.owner		= THIS_MODULE,
-	.name		= "felix ptp",
-	.max_adj	= 0x7fffffff,
-	.n_alarm	= 0,
-	.n_ext_ts	= 0,
-	.n_per_out	= OCELOT_PTP_PINS_NUM,
-	.n_pins		= OCELOT_PTP_PINS_NUM,
-	.pps		= 0,
-	.gettime64	= ocelot_ptp_gettime64,
-	.settime64	= ocelot_ptp_settime64,
-	.adjtime	= ocelot_ptp_adjtime,
-	.adjfine	= ocelot_ptp_adjfine,
-	.verify		= ocelot_ptp_verify,
-	.enable		= ocelot_ptp_enable,
-};
-
 /* Hardware initialization done here so that we can allocate structures with
  * devm without fear of dsa_register_switch returning -EPROBE_DEFER and causing
  * us to allocate structures twice (leak memory) and map PCI memory twice
@@ -570,9 +554,12 @@ static int felix_setup(struct dsa_switch *ds)
 	if (err)
 		return err;
 
-	ocelot_init(ocelot);
+	err = ocelot_init(ocelot);
+	if (err)
+		return err;
+
 	if (ocelot->ptp) {
-		err = ocelot_init_timestamp(ocelot, &ocelot_ptp_clock_info);
+		err = ocelot_init_timestamp(ocelot, felix->info->ptp_caps);
 		if (err) {
 			dev_err(ocelot->dev,
 				"Timestamp initialization failed\n");
@@ -620,10 +607,13 @@ static void felix_teardown(struct dsa_switch *ds)
 {
 	struct ocelot *ocelot = ds->priv;
 	struct felix *felix = ocelot_to_felix(ocelot);
+	int port;
 
 	if (felix->info->mdio_bus_free)
 		felix->info->mdio_bus_free(ocelot);
 
+	for (port = 0; port < ocelot->num_phys_ports; port++)
+		ocelot_deinit_port(ocelot, port);
 	ocelot_deinit_timestamp(ocelot);
 	/* stop workqueue thread */
 	ocelot_deinit(ocelot);
@@ -796,31 +786,5 @@ const struct dsa_switch_ops felix_switch_ops = {
 	.cls_flower_add		= felix_cls_flower_add,
 	.cls_flower_del		= felix_cls_flower_del,
 	.cls_flower_stats	= felix_cls_flower_stats,
-	.port_setup_tc          = felix_port_setup_tc,
+	.port_setup_tc		= felix_port_setup_tc,
 };
-
-static int __init felix_init(void)
-{
-	int err;
-
-	err = pci_register_driver(&felix_vsc9959_pci_driver);
-	if (err)
-		return err;
-
-	err = platform_driver_register(&seville_vsc9953_driver);
-	if (err)
-		return err;
-
-	return 0;
-}
-module_init(felix_init);
-
-static void __exit felix_exit(void)
-{
-	pci_unregister_driver(&felix_vsc9959_pci_driver);
-	platform_driver_unregister(&seville_vsc9953_driver);
-}
-module_exit(felix_exit);
-
-MODULE_DESCRIPTION("Felix Switch driver");
-MODULE_LICENSE("GPL v2");

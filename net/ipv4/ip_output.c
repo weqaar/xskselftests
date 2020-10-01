@@ -74,6 +74,7 @@
 #include <net/icmp.h>
 #include <net/checksum.h>
 #include <net/inetpeer.h>
+#include <net/inet_ecn.h>
 #include <net/lwtunnel.h>
 #include <linux/bpf-cgroup.h>
 #include <linux/igmp.h>
@@ -142,7 +143,8 @@ static inline int ip_select_ttl(struct inet_sock *inet, struct dst_entry *dst)
  *
  */
 int ip_build_and_send_pkt(struct sk_buff *skb, const struct sock *sk,
-			  __be32 saddr, __be32 daddr, struct ip_options_rcu *opt)
+			  __be32 saddr, __be32 daddr, struct ip_options_rcu *opt,
+			  u8 tos)
 {
 	struct inet_sock *inet = inet_sk(sk);
 	struct rtable *rt = skb_rtable(skb);
@@ -155,7 +157,7 @@ int ip_build_and_send_pkt(struct sk_buff *skb, const struct sock *sk,
 	iph = ip_hdr(skb);
 	iph->version  = 4;
 	iph->ihl      = 5;
-	iph->tos      = inet->tos;
+	iph->tos      = tos;
 	iph->ttl      = ip_select_ttl(inet, &rt->dst);
 	iph->daddr    = (opt && opt->opt.srr ? opt->opt.faddr : daddr);
 	iph->saddr    = saddr;
@@ -1703,7 +1705,7 @@ void ip_send_unicast_reply(struct sock *sk, struct sk_buff *skb,
 	if (IS_ERR(rt))
 		return;
 
-	inet_sk(sk)->tos = arg->tos;
+	inet_sk(sk)->tos = arg->tos & ~INET_ECN_MASK;
 
 	sk->sk_protocol = ip_hdr(skb)->protocol;
 	sk->sk_bound_dev_if = arg->bound_dev_if;

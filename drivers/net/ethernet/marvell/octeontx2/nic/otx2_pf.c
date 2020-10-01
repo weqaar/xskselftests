@@ -22,6 +22,7 @@
 #include "otx2_txrx.h"
 #include "otx2_struct.h"
 #include "otx2_ptp.h"
+#include <rvu_trace.h>
 
 #define DRV_NAME	"octeontx2-nicpf"
 #define DRV_STRING	"Marvell OcteonTX2 NIC Physical Function Driver"
@@ -558,6 +559,8 @@ static irqreturn_t otx2_pfvf_mbox_intr_handler(int irq, void *pf_irq)
 
 	otx2_queue_work(mbox, pf->mbox_pfvf_wq, 0, vfs, intr, TYPE_PFVF);
 
+	trace_otx2_msg_interrupt(mbox->mbox.pdev, "VF(s) to PF", intr);
+
 	return IRQ_HANDLED;
 }
 
@@ -940,6 +943,9 @@ static irqreturn_t otx2_pfaf_mbox_intr_handler(int irq, void *pf_irq)
 	otx2_write64(pf, RVU_PF_INT, BIT_ULL(0));
 
 	mbox = &pf->mbox;
+
+	trace_otx2_msg_interrupt(mbox->mbox.pdev, "AF to PF", BIT_ULL(0));
+
 	otx2_queue_work(mbox, pf->mbox_wq, 0, 1, 1, TYPE_PFAF);
 
 	return IRQ_HANDLED;
@@ -1500,6 +1506,9 @@ int otx2_open(struct net_device *netdev)
 	err = otx2_hw_set_mtu(pf, netdev->mtu);
 	if (err)
 		goto err_disable_napi;
+
+	/* Setup segmentation algorithms, if failed, clear offload capability */
+	otx2_setup_segmentation(pf);
 
 	/* Initialize RSS */
 	err = otx2_rss_init(pf);
@@ -2091,7 +2100,8 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	netdev->hw_features = (NETIF_F_RXCSUM | NETIF_F_IP_CSUM |
 			       NETIF_F_IPV6_CSUM | NETIF_F_RXHASH |
-			       NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6);
+			       NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6 |
+			       NETIF_F_GSO_UDP_L4);
 	netdev->features |= netdev->hw_features;
 
 	netdev->hw_features |= NETIF_F_LOOPBACK | NETIF_F_RXALL;

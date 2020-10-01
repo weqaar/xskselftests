@@ -42,6 +42,20 @@ static int ionic_start_queues(struct ionic_lif *lif);
 static void ionic_stop_queues(struct ionic_lif *lif);
 static void ionic_lif_queue_identify(struct ionic_lif *lif);
 
+static void ionic_dim_work(struct work_struct *work)
+{
+	struct dim *dim = container_of(work, struct dim, work);
+	struct dim_cq_moder cur_moder;
+	struct ionic_qcq *qcq;
+	u32 new_coal;
+
+	cur_moder = net_dim_get_rx_moderation(dim->mode, dim->profile_ix);
+	qcq = container_of(dim, struct ionic_qcq, dim);
+	new_coal = ionic_coal_usec_to_hw(qcq->q.lif->ionic, cur_moder.usec);
+	qcq->intr.dim_coal_hw = new_coal ? new_coal : 1;
+	dim->state = DIM_START_MEASURE;
+}
+
 static void ionic_lif_deferred_work(struct work_struct *work)
 {
 	struct ionic_lif *lif = container_of(work, struct ionic_lif, deferred.work);
@@ -270,6 +284,7 @@ static int ionic_qcq_disable(struct ionic_qcq *qcq)
 		ctx.cmd.q_control.index, ctx.cmd.q_control.type);
 
 	if (qcq->flags & IONIC_QCQ_F_INTR) {
+		cancel_work_sync(&qcq->dim.work);
 		ionic_intr_mask(idev->intr_ctrl, qcq->intr.index,
 				IONIC_INTR_MASK_SET);
 		synchronize_irq(qcq->intr.vector);
@@ -542,6 +557,9 @@ static int ionic_qcq_alloc(struct ionic_lif *lif, unsigned int type,
 		ionic_q_sg_map(&new->q, sg_base, sg_base_pa);
 	}
 
+	INIT_WORK(&new->dim.work, ionic_dim_work);
+	new->dim.mode = DIM_CQ_PERIOD_MODE_START_FROM_EQE;
+
 	*qcq = new;
 
 	return 0;
@@ -800,21 +818,6 @@ static bool ionic_notifyq_service(struct ionic_cq *cq,
 	return true;
 }
 
-static int ionic_notifyq_clean(struct ionic_lif *lif, int budget)
-{
-	struct ionic_dev *idev = &lif->ionic->idev;
-	struct ionic_cq *cq = &lif->notifyqcq->cq;
-	u32 work_done;
-
-	work_done = ionic_cq_service(cq, budget, ionic_notifyq_service,
-				     NULL, NULL);
-	if (work_done)
-		ionic_intr_credits(idev->intr_ctrl, cq->bound_intr->index,
-				   work_done, IONIC_INTR_CRED_RESET_COALESCE);
-
-	return work_done;
-}
-
 static bool ionic_adminq_service(struct ionic_cq *cq,
 				 struct ionic_cq_info *cq_info)
 {
@@ -830,15 +833,36 @@ static bool ionic_adminq_service(struct ionic_cq *cq,
 
 static int ionic_adminq_napi(struct napi_struct *napi, int budget)
 {
+	struct ionic_intr_info *intr = napi_to_cq(napi)->bound_intr;
 	struct ionic_lif *lif = napi_to_cq(napi)->lif;
+	struct ionic_dev *idev = &lif->ionic->idev;
+	unsigned int flags = 0;
 	int n_work = 0;
 	int a_work = 0;
+	int work_done;
 
-	if (likely(lif->notifyqcq && lif->notifyqcq->flags & IONIC_QCQ_F_INITED))
-		n_work = ionic_notifyq_clean(lif, budget);
-	a_work = ionic_napi(napi, budget, ionic_adminq_service, NULL, NULL);
+	if (lif->notifyqcq && lif->notifyqcq->flags & IONIC_QCQ_F_INITED)
+		n_work = ionic_cq_service(&lif->notifyqcq->cq, budget,
+					  ionic_notifyq_service, NULL, NULL);
 
-	return max(n_work, a_work);
+	if (lif->adminqcq && lif->adminqcq->flags & IONIC_QCQ_F_INITED)
+		a_work = ionic_cq_service(&lif->adminqcq->cq, budget,
+					  ionic_adminq_service, NULL, NULL);
+
+	work_done = max(n_work, a_work);
+	if (work_done < budget && napi_complete_done(napi, work_done)) {
+		flags |= IONIC_INTR_CRED_UNMASK;
+		lif->adminqcq->cq.bound_intr->rearm_count++;
+	}
+
+	if (work_done || flags) {
+		flags |= IONIC_INTR_CRED_RESET_COALESCE;
+		ionic_intr_credits(idev->intr_ctrl,
+				   intr->index,
+				   n_work + a_work, flags);
+	}
+
+	return work_done;
 }
 
 void ionic_get_stats64(struct net_device *netdev,
@@ -1633,10 +1657,13 @@ static int ionic_txrx_alloc(struct ionic_lif *lif)
 		if (err)
 			goto err_out;
 
-		if (flags & IONIC_QCQ_F_INTR)
+		if (flags & IONIC_QCQ_F_INTR) {
 			ionic_intr_coal_init(lif->ionic->idev.intr_ctrl,
 					     lif->txqcqs[i]->intr.index,
 					     lif->tx_coalesce_hw);
+			if (test_bit(IONIC_LIF_F_TX_DIM_INTR, lif->state))
+				lif->txqcqs[i]->intr.dim_coal_hw = lif->tx_coalesce_hw;
+		}
 
 		ionic_debugfs_add_qcq(lif, lif->txqcqs[i]);
 	}
@@ -1655,6 +1682,8 @@ static int ionic_txrx_alloc(struct ionic_lif *lif)
 		ionic_intr_coal_init(lif->ionic->idev.intr_ctrl,
 				     lif->rxqcqs[i]->intr.index,
 				     lif->rx_coalesce_hw);
+		if (test_bit(IONIC_LIF_F_RX_DIM_INTR, lif->state))
+			lif->rxqcqs[i]->intr.dim_coal_hw = lif->rx_coalesce_hw;
 
 		if (!test_bit(IONIC_LIF_F_SPLIT_INTR, lif->state))
 			ionic_link_qcq_interrupts(lif->rxqcqs[i],
@@ -2228,10 +2257,27 @@ int ionic_reconfigure_queues(struct ionic_lif *lif,
 				ionic_intr_coal_init(lif->ionic->idev.intr_ctrl,
 						     lif->txqcqs[i]->intr.index,
 						     lif->tx_coalesce_hw);
+				if (test_bit(IONIC_LIF_F_TX_DIM_INTR, lif->state))
+					lif->txqcqs[i]->intr.dim_coal_hw = lif->tx_coalesce_hw;
 			} else {
 				lif->txqcqs[i]->flags &= ~IONIC_QCQ_F_INTR;
 				ionic_link_qcq_interrupts(lif->rxqcqs[i], lif->txqcqs[i]);
 			}
+		}
+	}
+
+	/* now we can rework the debugfs mappings */
+	if (tx_qcqs) {
+		for (i = 0; i < qparam->nxqs; i++) {
+			ionic_debugfs_del_qcq(lif->txqcqs[i]);
+			ionic_debugfs_add_qcq(lif, lif->txqcqs[i]);
+		}
+	}
+
+	if (rx_qcqs) {
+		for (i = 0; i < qparam->nxqs; i++) {
+			ionic_debugfs_del_qcq(lif->rxqcqs[i]);
+			ionic_debugfs_add_qcq(lif, lif->rxqcqs[i]);
 		}
 	}
 
@@ -2340,6 +2386,8 @@ int ionic_lif_alloc(struct ionic *ionic)
 						    lif->rx_coalesce_usecs);
 	lif->tx_coalesce_usecs = lif->rx_coalesce_usecs;
 	lif->tx_coalesce_hw = lif->rx_coalesce_hw;
+	set_bit(IONIC_LIF_F_RX_DIM_INTR, lif->state);
+	set_bit(IONIC_LIF_F_TX_DIM_INTR, lif->state);
 
 	snprintf(lif->name, sizeof(lif->name), "lif%u", lif->index);
 

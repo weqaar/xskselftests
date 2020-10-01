@@ -70,6 +70,7 @@ struct udp_tunnel_nic;
 struct bpf_prog;
 struct xdp_buff;
 
+void synchronize_net(void);
 void netdev_set_default_ethtool_ops(struct net_device *dev,
 				    const struct ethtool_ops *ops);
 
@@ -354,7 +355,7 @@ enum {
 	NAPI_STATE_MISSED,	/* reschedule a napi */
 	NAPI_STATE_DISABLE,	/* Disable pending */
 	NAPI_STATE_NPSVC,	/* Netpoll - don't dequeue from poll_list */
-	NAPI_STATE_HASHED,	/* In NAPI hash (busy polling possible) */
+	NAPI_STATE_LISTED,	/* NAPI added to system lists */
 	NAPI_STATE_NO_BUSY_POLL,/* Do not add in napi_hash, no busy polling */
 	NAPI_STATE_IN_BUSY_POLL,/* sk_busy_loop() owns this NAPI */
 };
@@ -364,7 +365,7 @@ enum {
 	NAPIF_STATE_MISSED	 = BIT(NAPI_STATE_MISSED),
 	NAPIF_STATE_DISABLE	 = BIT(NAPI_STATE_DISABLE),
 	NAPIF_STATE_NPSVC	 = BIT(NAPI_STATE_NPSVC),
-	NAPIF_STATE_HASHED	 = BIT(NAPI_STATE_HASHED),
+	NAPIF_STATE_LISTED	 = BIT(NAPI_STATE_LISTED),
 	NAPIF_STATE_NO_BUSY_POLL = BIT(NAPI_STATE_NO_BUSY_POLL),
 	NAPIF_STATE_IN_BUSY_POLL = BIT(NAPI_STATE_IN_BUSY_POLL),
 };
@@ -487,20 +488,6 @@ static inline bool napi_complete(struct napi_struct *n)
 {
 	return napi_complete_done(n, 0);
 }
-
-/**
- *	napi_hash_del - remove a NAPI from global table
- *	@napi: NAPI context
- *
- * Warning: caller must observe RCU grace period
- * before freeing memory containing @napi, if
- * this function returns true.
- * Note: core networking stack automatically calls it
- * from netif_napi_del().
- * Drivers might want to call this helper to combine all
- * the needed RCU grace periods into a single one.
- */
-bool napi_hash_del(struct napi_struct *napi);
 
 /**
  *	napi_disable - prevent NAPI from scheduling
@@ -647,8 +634,9 @@ extern int sysctl_devconf_inherit_init_net;
  */
 static inline bool net_has_fallback_tunnels(const struct net *net)
 {
-	return (net == &init_net && sysctl_fb_tunnels_only_for_init_net == 1) ||
-	       !sysctl_fb_tunnels_only_for_init_net;
+	return !IS_ENABLED(CONFIG_SYSCTL) ||
+	       !sysctl_fb_tunnels_only_for_init_net ||
+	       (net == &init_net && sysctl_fb_tunnels_only_for_init_net == 1);
 }
 
 static inline int netdev_queue_numa_node_read(const struct netdev_queue *q)
@@ -1788,6 +1776,7 @@ enum netdev_priv_flags {
  *				the watchdog (see dev_watchdog())
  *	@watchdog_timer:	List of timers
  *
+ *	@proto_down_reason:	reason a netdev interface is held down
  *	@pcpu_refcnt:		Number of references to this device
  *	@todo_list:		Delayed register/unregister
  *	@link_watch_list:	XXX: need comments on this one
@@ -1852,6 +1841,7 @@ enum netdev_priv_flags {
  *	@udp_tunnel_nic_info:	static structure describing the UDP tunnel
  *				offload capabilities of the device
  *	@udp_tunnel_nic:	UDP tunnel offload state
+ *	@xdp_state:		stores info on attached XDP BPF programs
  *
  *	FIXME: cleanup struct net_device such that network protocol info
  *	moves out.
@@ -2368,12 +2358,26 @@ static inline void netif_tx_napi_add(struct net_device *dev,
 }
 
 /**
+ *  __netif_napi_del - remove a NAPI context
+ *  @napi: NAPI context
+ *
+ * Warning: caller must observe RCU grace period before freeing memory
+ * containing @napi. Drivers might want to call this helper to combine
+ * all the needed RCU grace periods into a single one.
+ */
+void __netif_napi_del(struct napi_struct *napi);
+
+/**
  *  netif_napi_del - remove a NAPI context
  *  @napi: NAPI context
  *
  *  netif_napi_del() removes a NAPI context from the network device NAPI list
  */
-void netif_napi_del(struct napi_struct *napi);
+static inline void netif_napi_del(struct napi_struct *napi)
+{
+	__netif_napi_del(napi);
+	synchronize_net();
+}
 
 struct napi_gro_cb {
 	/* Virtual address of skb_shinfo(skb)->frags[0].page + offset. */
@@ -2797,7 +2801,6 @@ static inline void unregister_netdevice(struct net_device *dev)
 int netdev_refcnt_read(const struct net_device *dev);
 void free_netdev(struct net_device *dev);
 void netdev_freemem(struct net_device *dev);
-void synchronize_net(void);
 int init_dummy_netdev(struct net_device *dev);
 
 struct net_device *netdev_get_xmit_slave(struct net_device *dev,
@@ -4676,16 +4679,6 @@ int netdev_class_create_file_ns(const struct class_attribute *class_attr,
 				const void *ns);
 void netdev_class_remove_file_ns(const struct class_attribute *class_attr,
 				 const void *ns);
-
-static inline int netdev_class_create_file(const struct class_attribute *class_attr)
-{
-	return netdev_class_create_file_ns(class_attr, NULL);
-}
-
-static inline void netdev_class_remove_file(const struct class_attribute *class_attr)
-{
-	netdev_class_remove_file_ns(class_attr, NULL);
-}
 
 extern const struct kobj_ns_type_operations net_ns_type_operations;
 

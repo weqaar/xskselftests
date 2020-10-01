@@ -155,8 +155,7 @@ static void cpu_map_kthread_stop(struct work_struct *work)
 	kthread_stop(rcpu->kthread);
 }
 
-static struct sk_buff *cpu_map_build_skb(struct bpf_cpu_map_entry *rcpu,
-					 struct xdp_frame *xdpf,
+static struct sk_buff *cpu_map_build_skb(struct xdp_frame *xdpf,
 					 struct sk_buff *skb)
 {
 	unsigned int hard_start_headroom;
@@ -277,7 +276,7 @@ static int cpu_map_bpf_prog_run_xdp(struct bpf_cpu_map_entry *rcpu,
 			break;
 		default:
 			bpf_warn_invalid_xdp_action(act);
-			/* fallthrough */
+			fallthrough;
 		case XDP_DROP:
 			xdp_return_frame(xdpf);
 			stats->drop++;
@@ -365,7 +364,7 @@ static int cpu_map_kthread_run(void *data)
 			struct sk_buff *skb = skbs[i];
 			int ret;
 
-			skb = cpu_map_build_skb(rcpu, xdpf, skb);
+			skb = cpu_map_build_skb(xdpf, skb);
 			if (!skb) {
 				xdp_return_frame(xdpf);
 				continue;
