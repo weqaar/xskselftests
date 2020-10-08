@@ -994,6 +994,7 @@ static int atl2_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
 /**
  * atl2_tx_timeout - Respond to a Tx Hang
  * @netdev: network interface device structure
+ * @txqueue: index of the hanging transmit queue
  */
 static void atl2_tx_timeout(struct net_device *netdev, unsigned int txqueue)
 {
@@ -1005,7 +1006,7 @@ static void atl2_tx_timeout(struct net_device *netdev, unsigned int txqueue)
 
 /**
  * atl2_watchdog - Timer Call-back
- * @data: pointer to netdev cast into an unsigned long
+ * @t: timer list containing a pointer to netdev cast into an unsigned long
  */
 static void atl2_watchdog(struct timer_list *t)
 {
@@ -1030,7 +1031,7 @@ static void atl2_watchdog(struct timer_list *t)
 
 /**
  * atl2_phy_config - Timer Call-back
- * @data: pointer to netdev cast into an unsigned long
+ * @t: timer list containing a pointer to netdev cast into an unsigned long
  */
 static void atl2_phy_config(struct timer_list *t)
 {
@@ -1085,7 +1086,6 @@ err_up:
 
 static void atl2_reinit_locked(struct atl2_adapter *adapter)
 {
-	WARN_ON(in_interrupt());
 	while (test_and_set_bit(__ATL2_RESETTING, &adapter->flags))
 		msleep(1);
 	atl2_down(adapter);
@@ -1235,6 +1235,7 @@ static int atl2_check_link(struct atl2_adapter *adapter)
 
 /**
  * atl2_link_chg_task - deal with link change event Out of interrupt context
+ * @work: pointer to work struct with private info
  */
 static void atl2_link_chg_task(struct work_struct *work)
 {
