@@ -1562,16 +1562,6 @@ static void rtl8169_do_counters(struct rtl8169_private *tp, u32 counter_cmd)
 	rtl_loop_wait_low(tp, &rtl_counters_cond, 10, 1000);
 }
 
-static void rtl8169_reset_counters(struct rtl8169_private *tp)
-{
-	/*
-	 * Versions prior to RTL_GIGA_MAC_VER_19 don't support resetting the
-	 * tally counters.
-	 */
-	if (tp->mac_version >= RTL_GIGA_MAC_VER_19)
-		rtl8169_do_counters(tp, CounterReset);
-}
-
 static void rtl8169_update_counters(struct rtl8169_private *tp)
 {
 	u8 val = RTL_R8(tp, ChipCmd);
@@ -1606,13 +1596,16 @@ static void rtl8169_init_counter_offsets(struct rtl8169_private *tp)
 	if (tp->tc_offset.inited)
 		return;
 
-	rtl8169_reset_counters(tp);
-	rtl8169_update_counters(tp);
+	if (tp->mac_version >= RTL_GIGA_MAC_VER_19) {
+		rtl8169_do_counters(tp, CounterReset);
+	} else {
+		rtl8169_update_counters(tp);
+		tp->tc_offset.tx_errors = counters->tx_errors;
+		tp->tc_offset.tx_multi_collision = counters->tx_multi_collision;
+		tp->tc_offset.tx_aborted = counters->tx_aborted;
+		tp->tc_offset.rx_missed = counters->rx_missed;
+	}
 
-	tp->tc_offset.tx_errors = counters->tx_errors;
-	tp->tc_offset.tx_multi_collision = counters->tx_multi_collision;
-	tp->tc_offset.tx_aborted = counters->tx_aborted;
-	tp->tc_offset.rx_missed = counters->rx_missed;
 	tp->tc_offset.inited = true;
 }
 
@@ -4141,14 +4134,13 @@ static bool rtl8169_tso_csum_v2(struct rtl8169_private *tp,
 	return true;
 }
 
-static bool rtl_tx_slots_avail(struct rtl8169_private *tp,
-			       unsigned int nr_frags)
+static bool rtl_tx_slots_avail(struct rtl8169_private *tp)
 {
 	unsigned int slots_avail = READ_ONCE(tp->dirty_tx) + NUM_TX_DESC
 					- READ_ONCE(tp->cur_tx);
 
 	/* A skbuff with nr_frags needs nr_frags+1 entries in the tx queue */
-	return slots_avail > nr_frags;
+	return slots_avail > MAX_SKB_FRAGS;
 }
 
 /* Versions RTL8102e and from RTL8168c onwards support csum_v2 */
@@ -4181,16 +4173,11 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
 	bool stop_queue, door_bell;
 	u32 opts[2];
 
-	txd_first = tp->TxDescArray + entry;
-
-	if (unlikely(!rtl_tx_slots_avail(tp, frags))) {
+	if (unlikely(!rtl_tx_slots_avail(tp))) {
 		if (net_ratelimit())
 			netdev_err(dev, "BUG! Tx Ring full when queue awake!\n");
 		goto err_stop_0;
 	}
-
-	if (unlikely(le32_to_cpu(txd_first->opts1) & DescOwn))
-		goto err_stop_0;
 
 	opts[1] = rtl8169_tx_vlan_tag(skb);
 	opts[0] = 0;
@@ -4203,6 +4190,8 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
 	if (unlikely(rtl8169_tx_map(tp, opts, skb_headlen(skb), skb->data,
 				    entry, false)))
 		goto err_dma_0;
+
+	txd_first = tp->TxDescArray + entry;
 
 	if (frags) {
 		if (rtl8169_xmit_frags(tp, skb, opts, entry))
@@ -4226,22 +4215,15 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
 	/* rtl_tx needs to see descriptor changes before updated tp->cur_tx */
 	smp_wmb();
 
-	tp->cur_tx += frags + 1;
+	WRITE_ONCE(tp->cur_tx, tp->cur_tx + frags + 1);
 
-	stop_queue = !rtl_tx_slots_avail(tp, MAX_SKB_FRAGS);
+	stop_queue = !rtl_tx_slots_avail(tp);
 	if (unlikely(stop_queue)) {
 		/* Avoid wrongly optimistic queue wake-up: rtl_tx thread must
 		 * not miss a ring update when it notices a stopped queue.
 		 */
 		smp_wmb();
 		netif_stop_queue(dev);
-		door_bell = true;
-	}
-
-	if (door_bell)
-		rtl8169_doorbell(tp);
-
-	if (unlikely(stop_queue)) {
 		/* Sync with rtl_tx:
 		 * - publish queue status and cur_tx ring index (write barrier)
 		 * - refresh dirty_tx ring index (read barrier).
@@ -4249,10 +4231,14 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
 		 * status and forget to wake up queue, a racing rtl_tx thread
 		 * can't.
 		 */
-		smp_mb();
-		if (rtl_tx_slots_avail(tp, MAX_SKB_FRAGS))
+		smp_mb__after_atomic();
+		if (rtl_tx_slots_avail(tp))
 			netif_start_queue(dev);
+		door_bell = true;
 	}
+
+	if (door_bell)
+		rtl8169_doorbell(tp);
 
 	return NETDEV_TX_OK;
 
@@ -4363,18 +4349,19 @@ static void rtl_tx(struct net_device *dev, struct rtl8169_private *tp,
 		   int budget)
 {
 	unsigned int dirty_tx, bytes_compl = 0, pkts_compl = 0;
+	struct sk_buff *skb;
 
 	dirty_tx = tp->dirty_tx;
 
 	while (READ_ONCE(tp->cur_tx) != dirty_tx) {
 		unsigned int entry = dirty_tx % NUM_TX_DESC;
-		struct sk_buff *skb = tp->tx_skb[entry].skb;
 		u32 status;
 
 		status = le32_to_cpu(tp->TxDescArray[entry].opts1);
 		if (status & DescOwn)
 			break;
 
+		skb = tp->tx_skb[entry].skb;
 		rtl8169_unmap_tx_skb(tp, entry);
 
 		if (skb) {
@@ -4397,17 +4384,17 @@ static void rtl_tx(struct net_device *dev, struct rtl8169_private *tp,
 		 * ring status.
 		 */
 		smp_store_mb(tp->dirty_tx, dirty_tx);
-		if (netif_queue_stopped(dev) &&
-		    rtl_tx_slots_avail(tp, MAX_SKB_FRAGS)) {
+		if (netif_queue_stopped(dev) && rtl_tx_slots_avail(tp))
 			netif_wake_queue(dev);
-		}
 		/*
 		 * 8168 hack: TxPoll requests are lost when the Tx packets are
 		 * too close. Let's kick an extra TxPoll request when a burst
 		 * of start_xmit activity is detected (if it is not detected,
 		 * it is slow enough). -- FR
+		 * If skb is NULL then we come here again once a tx irq is
+		 * triggered after the last fragment is marked transmitted.
 		 */
-		if (tp->cur_tx != dirty_tx)
+		if (tp->cur_tx != dirty_tx && skb)
 			rtl8169_doorbell(tp);
 	}
 }
@@ -5171,8 +5158,8 @@ static int rtl_get_ether_clk(struct rtl8169_private *tp)
 		if (rc == -ENOENT)
 			/* clk-core allows NULL (for suspend / resume) */
 			rc = 0;
-		else if (rc != -EPROBE_DEFER)
-			dev_err(d, "failed to get clk: %d\n", rc);
+		else
+			dev_err_probe(d, rc, "failed to get clk\n");
 	} else {
 		tp->clk = clk;
 		rc = clk_prepare_enable(clk);

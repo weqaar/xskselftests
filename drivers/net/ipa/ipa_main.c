@@ -70,6 +70,14 @@
 #define IPA_FWS_PATH		"ipa_fws.mdt"
 #define IPA_PAS_ID		15
 
+/* Shift of 19.2 MHz timestamp to achieve lower resolution timestamps */
+#define DPL_TIMESTAMP_SHIFT	14	/* ~1.172 kHz, ~853 usec per tick */
+#define TAG_TIMESTAMP_SHIFT	14
+#define NAT_TIMESTAMP_SHIFT	24	/* ~1.144 Hz, ~874 msec per tick */
+
+/* Divider for 19.2 MHz crystal oscillator clock to get common timer clock */
+#define IPA_XO_CLOCK_DIVIDER	192	/* 1 is subtracted where used */
+
 /**
  * ipa_suspend_handler() - Handle the suspend IPA interrupt
  * @ipa:	IPA pointer
@@ -230,8 +238,10 @@ static void ipa_hardware_config_comp(struct ipa *ipa)
 		val &= ~IPA_QMB_SELECT_CONS_EN_FMASK;
 		val &= ~IPA_QMB_SELECT_PROD_EN_FMASK;
 		val &= ~IPA_QMB_SELECT_GLOBAL_EN_FMASK;
-	} else  {
+	} else if (ipa->version < IPA_VERSION_4_5) {
 		val |= GSI_MULTI_AXI_MASTERS_DIS_FMASK;
+	} else {
+		/* For IPA v4.5 IPA_FULL_FLUSH_WAIT_RSC_CLOSE_EN is 0 */
 	}
 
 	val |= GSI_MULTI_INORDER_RD_DIS_FMASK;
@@ -243,29 +253,98 @@ static void ipa_hardware_config_comp(struct ipa *ipa)
 /* Configure DDR and PCIe max read/write QSB values */
 static void ipa_hardware_config_qsb(struct ipa *ipa)
 {
+	enum ipa_version version = ipa->version;
+	u32 max0;
+	u32 max1;
 	u32 val;
 
-	/* QMB_0 represents DDR; QMB_1 represents PCIe (not present in 4.2) */
+	/* QMB_0 represents DDR; QMB_1 represents PCIe */
 	val = u32_encode_bits(8, GEN_QMB_0_MAX_WRITES_FMASK);
-	if (ipa->version == IPA_VERSION_4_2)
-		val |= u32_encode_bits(0, GEN_QMB_1_MAX_WRITES_FMASK);
-	else
-		val |= u32_encode_bits(4, GEN_QMB_1_MAX_WRITES_FMASK);
+	switch (version) {
+	case IPA_VERSION_4_2:
+		max1 = 0;		/* PCIe not present */
+		break;
+	case IPA_VERSION_4_5:
+		max1 = 8;
+		break;
+	default:
+		max1 = 4;
+		break;
+	}
+	val |= u32_encode_bits(max1, GEN_QMB_1_MAX_WRITES_FMASK);
 	iowrite32(val, ipa->reg_virt + IPA_REG_QSB_MAX_WRITES_OFFSET);
 
-	if (ipa->version == IPA_VERSION_3_5_1) {
-		val = u32_encode_bits(8, GEN_QMB_0_MAX_READS_FMASK);
-		val |= u32_encode_bits(12, GEN_QMB_1_MAX_READS_FMASK);
-	} else {
-		val = u32_encode_bits(12, GEN_QMB_0_MAX_READS_FMASK);
-		if (ipa->version == IPA_VERSION_4_2)
-			val |= u32_encode_bits(0, GEN_QMB_1_MAX_READS_FMASK);
-		else
-			val |= u32_encode_bits(12, GEN_QMB_1_MAX_READS_FMASK);
+	max1 = 12;
+	switch (version) {
+	case IPA_VERSION_3_5_1:
+		max0 = 8;
+		break;
+	case IPA_VERSION_4_0:
+	case IPA_VERSION_4_1:
+		max0 = 12;
+		break;
+	case IPA_VERSION_4_2:
+		max0 = 12;
+		max1 = 0;		/* PCIe not present */
+		break;
+	case IPA_VERSION_4_5:
+		max0 = 0;		/* No limit (hardware maximum) */
+		break;
+	}
+	val = u32_encode_bits(max0, GEN_QMB_0_MAX_READS_FMASK);
+	val |= u32_encode_bits(max1, GEN_QMB_1_MAX_READS_FMASK);
+	if (version != IPA_VERSION_3_5_1) {
 		/* GEN_QMB_0_MAX_READS_BEATS is 0 */
 		/* GEN_QMB_1_MAX_READS_BEATS is 0 */
 	}
 	iowrite32(val, ipa->reg_virt + IPA_REG_QSB_MAX_READS_OFFSET);
+}
+
+/* IPA uses unified Qtime starting at IPA v4.5, implementing various
+ * timestamps and timers independent of the IPA core clock rate.  The
+ * Qtimer is based on a 56-bit timestamp incremented at each tick of
+ * a 19.2 MHz SoC crystal oscillator (XO clock).
+ *
+ * For IPA timestamps (tag, NAT, data path logging) a lower resolution
+ * timestamp is achieved by shifting the Qtimer timestamp value right
+ * some number of bits to produce the low-order bits of the coarser
+ * granularity timestamp.
+ *
+ * For timers, a common timer clock is derived from the XO clock using
+ * a divider (we use 192, to produce a 100kHz timer clock).  From
+ * this common clock, three "pulse generators" are used to produce
+ * timer ticks at a configurable frequency.  IPA timers (such as
+ * those used for aggregation or head-of-line block handling) now
+ * define their period based on one of these pulse generators.
+ */
+static void ipa_qtime_config(struct ipa *ipa)
+{
+	u32 val;
+
+	/* Timer clock divider must be disabled when we change the rate */
+	iowrite32(0, ipa->reg_virt + IPA_REG_TIMERS_XO_CLK_DIV_CFG_OFFSET);
+
+	/* Set DPL time stamp resolution to use Qtime (instead of 1 msec) */
+	val = u32_encode_bits(DPL_TIMESTAMP_SHIFT, DPL_TIMESTAMP_LSB_FMASK);
+	val |= u32_encode_bits(1, DPL_TIMESTAMP_SEL_FMASK);
+	/* Configure tag and NAT Qtime timestamp resolution as well */
+	val |= u32_encode_bits(TAG_TIMESTAMP_SHIFT, TAG_TIMESTAMP_LSB_FMASK);
+	val |= u32_encode_bits(NAT_TIMESTAMP_SHIFT, NAT_TIMESTAMP_LSB_FMASK);
+	iowrite32(val, ipa->reg_virt + IPA_REG_QTIME_TIMESTAMP_CFG_OFFSET);
+
+	/* Set granularity of pulse generators used for other timers */
+	val = u32_encode_bits(IPA_GRAN_100_US, GRAN_0_FMASK);
+	val |= u32_encode_bits(IPA_GRAN_1_MS, GRAN_1_FMASK);
+	val |= u32_encode_bits(IPA_GRAN_1_MS, GRAN_2_FMASK);
+	iowrite32(val, ipa->reg_virt + IPA_REG_TIMERS_PULSE_GRAN_CFG_OFFSET);
+
+	/* Actual divider is 1 more than value supplied here */
+	val = u32_encode_bits(IPA_XO_CLOCK_DIVIDER - 1, DIV_VALUE_FMASK);
+	iowrite32(val, ipa->reg_virt + IPA_REG_TIMERS_XO_CLK_DIV_CFG_OFFSET);
+
+	/* Divider value is set; re-enable the common timer clock divider */
+	val |= u32_encode_bits(1, DIV_ENABLE_FMASK);
+	iowrite32(val, ipa->reg_virt + IPA_REG_TIMERS_XO_CLK_DIV_CFG_OFFSET);
 }
 
 static void ipa_idle_indication_cfg(struct ipa *ipa,
@@ -294,7 +373,7 @@ static void ipa_idle_indication_cfg(struct ipa *ipa,
  */
 static void ipa_hardware_dcd_config(struct ipa *ipa)
 {
-	/* Recommended values for IPA 3.5 according to IPA HPG */
+	/* Recommended values for IPA 3.5 and later according to IPA HPG */
 	ipa_idle_indication_cfg(ipa, 256, false);
 }
 
@@ -310,22 +389,26 @@ static void ipa_hardware_dcd_deconfig(struct ipa *ipa)
  */
 static void ipa_hardware_config(struct ipa *ipa)
 {
+	enum ipa_version version = ipa->version;
 	u32 granularity;
 	u32 val;
 
-	/* Fill in backward-compatibility register, based on version */
-	val = ipa_reg_bcr_val(ipa->version);
-	iowrite32(val, ipa->reg_virt + IPA_REG_BCR_OFFSET);
+	/* IPA v4.5 has no backward compatibility register */
+	if (version < IPA_VERSION_4_5) {
+		val = ipa_reg_bcr_val(version);
+		iowrite32(val, ipa->reg_virt + IPA_REG_BCR_OFFSET);
+	}
 
-	if (ipa->version != IPA_VERSION_3_5_1) {
-		/* Enable open global clocks (hardware workaround) */
+	/* Implement some hardware workarounds */
+	if (version != IPA_VERSION_3_5_1 && version < IPA_VERSION_4_5) {
+		/* Enable open global clocks (not needed for IPA v4.5) */
 		val = GLOBAL_FMASK;
 		val |= GLOBAL_2X_CLK_FMASK;
 		iowrite32(val, ipa->reg_virt + IPA_REG_CLKON_CFG_OFFSET);
 
-		/* Disable PA mask to allow HOLB drop (hardware workaround) */
+		/* Disable PA mask to allow HOLB drop */
 		val = ioread32(ipa->reg_virt + IPA_REG_TX_CFG_OFFSET);
-		val &= ~PA_MASK_EN;
+		val &= ~PA_MASK_EN_FMASK;
 		iowrite32(val, ipa->reg_virt + IPA_REG_TX_CFG_OFFSET);
 	}
 
@@ -334,14 +417,21 @@ static void ipa_hardware_config(struct ipa *ipa)
 	/* Configure system bus limits */
 	ipa_hardware_config_qsb(ipa);
 
-	/* Configure aggregation granularity */
-	granularity = ipa_aggr_granularity_val(IPA_AGGR_GRANULARITY);
-	val = u32_encode_bits(granularity, AGGR_GRANULARITY);
-	iowrite32(val, ipa->reg_virt + IPA_REG_COUNTER_CFG_OFFSET);
+	if (version < IPA_VERSION_4_5) {
+		/* Configure aggregation timer granularity */
+		granularity = ipa_aggr_granularity_val(IPA_AGGR_GRANULARITY);
+		val = u32_encode_bits(granularity, AGGR_GRANULARITY_FMASK);
+		iowrite32(val, ipa->reg_virt + IPA_REG_COUNTER_CFG_OFFSET);
+	} else {
+		ipa_qtime_config(ipa);
+	}
 
-	/* Disable hashed IPv4 and IPv6 routing and filtering for IPA v4.2 */
-	if (ipa->version == IPA_VERSION_4_2)
-		iowrite32(0, ipa->reg_virt + IPA_REG_FILT_ROUT_HASH_EN_OFFSET);
+	/* IPA v4.2 does not support hashed tables, so disable them */
+	if (version == IPA_VERSION_4_2) {
+		u32 offset = ipa_reg_filt_rout_hash_en_offset(version);
+
+		iowrite32(0, ipa->reg_virt + offset);
+	}
 
 	/* Enable dynamic clock division */
 	ipa_hardware_dcd_config(ipa);
@@ -685,7 +775,7 @@ static void ipa_validate_build(void)
 	/* Aggregation granularity value can't be 0, and must fit */
 	BUILD_BUG_ON(!ipa_aggr_granularity_val(IPA_AGGR_GRANULARITY));
 	BUILD_BUG_ON(ipa_aggr_granularity_val(IPA_AGGR_GRANULARITY) >
-			field_max(AGGR_GRANULARITY));
+			field_max(AGGR_GRANULARITY_FMASK));
 #endif /* IPA_VALIDATE */
 }
 
@@ -725,6 +815,14 @@ static int ipa_probe(struct platform_device *pdev)
 
 	ipa_validate_build();
 
+	/* Get configuration data early; needed for clock initialization */
+	data = of_device_get_match_data(dev);
+	if (!data) {
+		/* This is really IPA_VALIDATE (should never happen) */
+		dev_err(dev, "matched hardware not supported\n");
+		return -ENODEV;
+	}
+
 	/* If we need Trust Zone, make sure it's available */
 	modem_init = of_property_read_bool(dev->of_node, "modem-init");
 	if (!modem_init)
@@ -745,22 +843,13 @@ static int ipa_probe(struct platform_device *pdev)
 	/* The clock and interconnects might not be ready when we're
 	 * probed, so might return -EPROBE_DEFER.
 	 */
-	clock = ipa_clock_init(dev);
+	clock = ipa_clock_init(dev, data->clock_data);
 	if (IS_ERR(clock)) {
 		ret = PTR_ERR(clock);
 		goto err_rproc_put;
 	}
 
-	/* No more EPROBE_DEFER.  Get our configuration data */
-	data = of_device_get_match_data(dev);
-	if (!data) {
-		/* This is really IPA_VALIDATE (should never happen) */
-		dev_err(dev, "matched hardware not supported\n");
-		ret = -ENOTSUPP;
-		goto err_clock_exit;
-	}
-
-	/* Allocate and initialize the IPA structure */
+	/* No more EPROBE_DEFER.  Allocate and initialize the IPA structure */
 	ipa = kzalloc(sizeof(*ipa), GFP_KERNEL);
 	if (!ipa) {
 		ret = -ENOMEM;
@@ -861,6 +950,11 @@ static int ipa_remove(struct platform_device *pdev)
 
 	if (ipa->setup_complete) {
 		ret = ipa_modem_stop(ipa);
+		/* If starting or stopping is in progress, try once more */
+		if (ret == -EBUSY) {
+			usleep_range(USEC_PER_MSEC, 2 * USEC_PER_MSEC);
+			ret = ipa_modem_stop(ipa);
+		}
 		if (ret)
 			return ret;
 
@@ -879,6 +973,15 @@ static int ipa_remove(struct platform_device *pdev)
 	rproc_put(rproc);
 
 	return 0;
+}
+
+static void ipa_shutdown(struct platform_device *pdev)
+{
+	int ret;
+
+	ret = ipa_remove(pdev);
+	if (ret)
+		dev_err(&pdev->dev, "shutdown: remove returned %d\n", ret);
 }
 
 /**
@@ -938,8 +1041,9 @@ static const struct dev_pm_ops ipa_pm_ops = {
 };
 
 static struct platform_driver ipa_driver = {
-	.probe	= ipa_probe,
-	.remove	= ipa_remove,
+	.probe		= ipa_probe,
+	.remove		= ipa_remove,
+	.shutdown	= ipa_shutdown,
 	.driver	= {
 		.name		= "ipa",
 		.pm		= &ipa_pm_ops,

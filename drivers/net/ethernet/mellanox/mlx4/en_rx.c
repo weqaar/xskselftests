@@ -283,7 +283,7 @@ int mlx4_en_create_rx_ring(struct mlx4_en_priv *priv,
 	ring->log_stride = ffs(ring->stride) - 1;
 	ring->buf_size = ring->size * ring->stride + TXBB_SIZE;
 
-	if (xdp_rxq_info_reg(&ring->xdp_rxq, priv->dev, queue_index) < 0)
+	if (xdp_rxq_info_reg(&ring->xdp_rxq, priv->dev, queue_index, 0) < 0)
 		goto err_ring;
 
 	tmp = size * roundup_pow_of_two(MLX4_EN_MAX_RX_FRAGS *
@@ -914,7 +914,6 @@ next:
 		wmb(); /* ensure HW sees CQ consumer before we post new buffers */
 		ring->cons = cq->mcq.cons_index;
 	}
-	AVG_PERF_COUNTER(priv->pstats.rx_coal_avg, polled);
 
 	mlx4_en_refill_rx_buffers(priv, ring);
 
@@ -965,8 +964,6 @@ int mlx4_en_poll_rx_cq(struct napi_struct *napi, int budget)
 
 		/* in case we got here because of !clean_complete */
 		done = budget;
-
-		INC_PERF_COUNTER(priv->pstats.napi_quota);
 
 		cpu_curr = smp_processor_id();
 		idata = irq_desc_get_irq_data(cq->irq_desc);

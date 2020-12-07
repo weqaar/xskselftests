@@ -140,17 +140,14 @@ clean_up:
 	return result;
 }
 
-static void lan743x_intr_software_isr(void *context)
+static void lan743x_intr_software_isr(struct lan743x_adapter *adapter)
 {
-	struct lan743x_adapter *adapter = context;
 	struct lan743x_intr *intr = &adapter->intr;
-	u32 int_sts;
 
-	int_sts = lan743x_csr_read(adapter, INT_STS);
-	if (int_sts & INT_BIT_SW_GP_) {
-		lan743x_csr_write(adapter, INT_STS, INT_BIT_SW_GP_);
-		intr->software_isr_flag = 1;
-	}
+	/* disable the interrupt to prevent repeated re-triggering */
+	lan743x_csr_write(adapter, INT_EN_CLR, INT_BIT_SW_GP_);
+	intr->software_isr_flag = true;
+	wake_up(&intr->software_isr_wq);
 }
 
 static void lan743x_tx_isr(void *context, u32 int_sts, u32 flags)
@@ -347,27 +344,22 @@ irq_done:
 static int lan743x_intr_test_isr(struct lan743x_adapter *adapter)
 {
 	struct lan743x_intr *intr = &adapter->intr;
-	int result = -ENODEV;
-	int timeout = 10;
+	int ret;
 
-	intr->software_isr_flag = 0;
+	intr->software_isr_flag = false;
 
-	/* enable interrupt */
+	/* enable and activate test interrupt */
 	lan743x_csr_write(adapter, INT_EN_SET, INT_BIT_SW_GP_);
-
-	/* activate interrupt here */
 	lan743x_csr_write(adapter, INT_SET, INT_BIT_SW_GP_);
-	while ((timeout > 0) && (!(intr->software_isr_flag))) {
-		usleep_range(1000, 20000);
-		timeout--;
-	}
 
-	if (intr->software_isr_flag)
-		result = 0;
+	ret = wait_event_timeout(intr->software_isr_wq,
+				 intr->software_isr_flag,
+				 msecs_to_jiffies(200));
 
-	/* disable interrupts */
+	/* disable test interrupt */
 	lan743x_csr_write(adapter, INT_EN_CLR, INT_BIT_SW_GP_);
-	return result;
+
+	return ret > 0 ? 0 : -ENODEV;
 }
 
 static int lan743x_intr_register_isr(struct lan743x_adapter *adapter,
@@ -540,6 +532,8 @@ static int lan743x_intr_open(struct lan743x_adapter *adapter)
 		flags |= LAN743X_VECTOR_FLAG_SOURCE_STATUS_R2C;
 		flags |= LAN743X_VECTOR_FLAG_SOURCE_ENABLE_R2C;
 	}
+
+	init_waitqueue_head(&intr->software_isr_wq);
 
 	ret = lan743x_intr_register_isr(adapter, 0, flags,
 					INT_BIT_ALL_RX_ | INT_BIT_ALL_TX_ |
@@ -956,7 +950,7 @@ static void lan743x_phy_link_status_change(struct net_device *netdev)
 		data = lan743x_csr_read(adapter, MAC_CR);
 
 		/* set interface mode */
-		if (phy_interface_mode_is_rgmii(adapter->phy_mode))
+		if (phy_interface_is_rgmii(phydev))
 			/* RGMII */
 			data &= ~MAC_CR_MII_EN_;
 		else
@@ -1012,33 +1006,14 @@ static void lan743x_phy_close(struct lan743x_adapter *adapter)
 
 static int lan743x_phy_open(struct lan743x_adapter *adapter)
 {
+	struct net_device *netdev = adapter->netdev;
 	struct lan743x_phy *phy = &adapter->phy;
-	struct phy_device *phydev = NULL;
-	struct device_node *phynode;
-	struct net_device *netdev;
+	struct phy_device *phydev;
 	int ret = -EIO;
 
-	netdev = adapter->netdev;
-	phynode = of_node_get(adapter->pdev->dev.of_node);
-
-	if (phynode) {
-		/* try devicetree phy, or fixed link */
-		of_get_phy_mode(phynode, &adapter->phy_mode);
-
-		if (of_phy_is_fixed_link(phynode)) {
-			ret = of_phy_register_fixed_link(phynode);
-			if (ret) {
-				netdev_err(netdev,
-					   "cannot register fixed PHY\n");
-				of_node_put(phynode);
-				goto return_error;
-			}
-		}
-		phydev = of_phy_connect(netdev, phynode,
-					lan743x_phy_link_status_change, 0,
-					adapter->phy_mode);
-		of_node_put(phynode);
-	}
+	/* try devicetree phy, or fixed link */
+	phydev = of_phy_get_and_connect(netdev, adapter->pdev->dev.of_node,
+					lan743x_phy_link_status_change);
 
 	if (!phydev) {
 		/* try internal phy */
@@ -1046,10 +1021,9 @@ static int lan743x_phy_open(struct lan743x_adapter *adapter)
 		if (!phydev)
 			goto return_error;
 
-		adapter->phy_mode = PHY_INTERFACE_MODE_GMII;
 		ret = phy_connect_direct(netdev, phydev,
 					 lan743x_phy_link_status_change,
-					 adapter->phy_mode);
+					 PHY_INTERFACE_MODE_GMII);
 		if (ret)
 			goto return_error;
 	}
@@ -1064,6 +1038,7 @@ static int lan743x_phy_open(struct lan743x_adapter *adapter)
 
 	phy_start(phydev);
 	phy_start_aneg(phydev);
+	phy_attached_info(phydev);
 	return 0;
 
 return_error:
@@ -1306,13 +1281,13 @@ clean_up_data_descriptor:
 		goto clear_active;
 
 	if (!(buffer_info->flags & TX_BUFFER_INFO_FLAG_TIMESTAMP_REQUESTED)) {
-		dev_kfree_skb(buffer_info->skb);
+		dev_kfree_skb_any(buffer_info->skb);
 		goto clear_skb;
 	}
 
 	if (cleanup) {
 		lan743x_ptp_unrequest_tx_timestamp(tx->adapter);
-		dev_kfree_skb(buffer_info->skb);
+		dev_kfree_skb_any(buffer_info->skb);
 	} else {
 		ignore_sync = (buffer_info->flags &
 			       TX_BUFFER_INFO_FLAG_IGNORE_SYNC) != 0;
@@ -1622,7 +1597,7 @@ static netdev_tx_t lan743x_tx_xmit_frame(struct lan743x_tx *tx,
 	if (required_number_of_descriptors >
 		lan743x_tx_get_avail_desc(tx)) {
 		if (required_number_of_descriptors > (tx->ring_size - 1)) {
-			dev_kfree_skb(skb);
+			dev_kfree_skb_irq(skb);
 		} else {
 			/* save to overflow buffer */
 			tx->overflow_skb = skb;
@@ -1655,7 +1630,7 @@ static netdev_tx_t lan743x_tx_xmit_frame(struct lan743x_tx *tx,
 				   start_frame_length,
 				   do_timestamp,
 				   skb->ip_summed == CHECKSUM_PARTIAL)) {
-		dev_kfree_skb(skb);
+		dev_kfree_skb_irq(skb);
 		goto unlock;
 	}
 
@@ -1674,7 +1649,7 @@ static netdev_tx_t lan743x_tx_xmit_frame(struct lan743x_tx *tx,
 			 * frame assembler clean up was performed inside
 			 *	lan743x_tx_frame_add_fragment
 			 */
-			dev_kfree_skb(skb);
+			dev_kfree_skb_irq(skb);
 			goto unlock;
 		}
 	}
